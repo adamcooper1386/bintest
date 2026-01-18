@@ -484,3 +484,685 @@ fn run_simple_command(run: &RunStep, ctx: &ExecutionContext) -> Result<(), Strin
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{CopyFile, WriteFile};
+
+    /// Helper to create a minimal test spec with one test.
+    fn make_spec(test: Test) -> TestSpec {
+        TestSpec {
+            version: 1,
+            sandbox: Sandbox::default(),
+            setup: vec![],
+            tests: vec![test],
+            teardown: vec![],
+        }
+    }
+
+    /// Helper to create a minimal test with a command.
+    fn make_test(name: &str, cmd: &str, args: Vec<&str>) -> Test {
+        Test {
+            name: name.to_string(),
+            description: None,
+            setup: vec![],
+            run: Run {
+                cmd: cmd.to_string(),
+                args: args.into_iter().map(String::from).collect(),
+                stdin: None,
+                env: HashMap::new(),
+                cwd: None,
+                shell: false,
+            },
+            expect: Expect::default(),
+            teardown: vec![],
+            timeout: None,
+            serial: false,
+        }
+    }
+
+    // ==================== Basic Execution Tests ====================
+
+    #[test]
+    fn test_simple_echo() {
+        let test = make_test("echo_test", "echo", vec!["hello"]);
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert_eq!(result.tests.len(), 1);
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+        assert_eq!(result.tests[0].name, "echo_test");
+    }
+
+    #[test]
+    fn test_exit_code_zero() {
+        let mut test = make_test("exit_zero", "true", vec![]);
+        test.expect.exit = Some(0);
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_exit_code_nonzero() {
+        let mut test = make_test("exit_one", "false", vec![]);
+        test.expect.exit = Some(1);
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_exit_code_mismatch() {
+        let mut test = make_test("exit_mismatch", "true", vec![]);
+        test.expect.exit = Some(1); // Expecting 1 but will get 0
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("Exit code"));
+    }
+
+    // ==================== Stdout Assertion Tests ====================
+
+    #[test]
+    fn test_stdout_exact_match() {
+        let mut test = make_test("stdout_exact", "echo", vec!["hello"]);
+        test.expect.stdout = Some(OutputMatch::Exact("hello\n".to_string()));
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_stdout_exact_mismatch() {
+        let mut test = make_test("stdout_exact_fail", "echo", vec!["hello"]);
+        test.expect.stdout = Some(OutputMatch::Exact("world\n".to_string()));
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("expected exact match"));
+    }
+
+    #[test]
+    fn test_stdout_contains() {
+        let mut test = make_test("stdout_contains", "echo", vec!["hello world"]);
+        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: Some("world".to_string()),
+            regex: None,
+        }));
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_stdout_contains_mismatch() {
+        let mut test = make_test("stdout_contains_fail", "echo", vec!["hello"]);
+        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: Some("world".to_string()),
+            regex: None,
+        }));
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("expected to contain"));
+    }
+
+    #[test]
+    fn test_stdout_regex() {
+        let mut test = make_test("stdout_regex", "echo", vec!["hello123world"]);
+        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: None,
+            regex: Some(r"hello\d+world".to_string()),
+        }));
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_stdout_regex_mismatch() {
+        let mut test = make_test("stdout_regex_fail", "echo", vec!["hello"]);
+        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: None,
+            regex: Some(r"\d+".to_string()),
+        }));
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("expected to match regex"));
+    }
+
+    #[test]
+    fn test_stdout_invalid_regex() {
+        let mut test = make_test("stdout_invalid_regex", "echo", vec!["hello"]);
+        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: None,
+            regex: Some(r"[invalid".to_string()),
+        }));
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("invalid regex"));
+    }
+
+    // ==================== Stderr Assertion Tests ====================
+
+    #[test]
+    fn test_stderr_contains() {
+        let mut test = make_test("stderr_test", "sh", vec!["-c", "echo error >&2"]);
+        test.expect.stderr = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: Some("error".to_string()),
+            regex: None,
+        }));
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    // ==================== File Expectation Tests ====================
+
+    #[test]
+    fn test_file_exists() {
+        let mut test = make_test("file_exists", "touch", vec!["output.txt"]);
+        test.expect.files = vec![FileExpect {
+            path: PathBuf::from("output.txt"),
+            exists: Some(true),
+            contents: None,
+        }];
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_file_not_exists() {
+        let mut test = make_test("file_not_exists", "true", vec![]);
+        test.expect.files = vec![FileExpect {
+            path: PathBuf::from("nonexistent.txt"),
+            exists: Some(false),
+            contents: None,
+        }];
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_file_exists_failure() {
+        let mut test = make_test("file_exists_fail", "true", vec![]);
+        test.expect.files = vec![FileExpect {
+            path: PathBuf::from("missing.txt"),
+            exists: Some(true),
+            contents: None,
+        }];
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("should exist"));
+    }
+
+    #[test]
+    fn test_file_contents() {
+        let mut test = make_test("file_contents", "sh", vec!["-c", "echo hello > output.txt"]);
+        test.expect.files = vec![FileExpect {
+            path: PathBuf::from("output.txt"),
+            exists: None,
+            contents: Some(OutputMatch::Exact("hello\n".to_string())),
+        }];
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_file_contents_contains() {
+        let mut test = make_test(
+            "file_contents_contains",
+            "sh",
+            vec!["-c", "echo 'hello world' > output.txt"],
+        );
+        test.expect.files = vec![FileExpect {
+            path: PathBuf::from("output.txt"),
+            exists: None,
+            contents: Some(OutputMatch::Structured(OutputMatchStructured {
+                equals: None,
+                contains: Some("world".to_string()),
+                regex: None,
+            })),
+        }];
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    // ==================== Setup/Teardown Tests ====================
+
+    #[test]
+    fn test_file_level_setup_write_file() {
+        let mut test = make_test("read_setup_file", "cat", vec!["config.txt"]);
+        test.expect.stdout = Some(OutputMatch::Exact("test config\n".to_string()));
+        let mut spec = make_spec(test);
+        spec.setup = vec![SetupStep {
+            write_file: Some(WriteFile {
+                path: PathBuf::from("config.txt"),
+                contents: "test config\n".to_string(),
+            }),
+            create_dir: None,
+            copy_file: None,
+            run: None,
+        }];
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_file_level_setup_create_dir() {
+        let mut test = make_test("check_dir", "test", vec!["-d", "subdir"]);
+        test.expect.exit = Some(0);
+        let mut spec = make_spec(test);
+        spec.setup = vec![SetupStep {
+            write_file: None,
+            create_dir: Some(PathBuf::from("subdir")),
+            copy_file: None,
+            run: None,
+        }];
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_test_level_setup() {
+        let mut test = make_test("read_test_setup_file", "cat", vec!["test_config.txt"]);
+        test.expect.stdout = Some(OutputMatch::Exact("per-test config\n".to_string()));
+        test.setup = vec![SetupStep {
+            write_file: Some(WriteFile {
+                path: PathBuf::from("test_config.txt"),
+                contents: "per-test config\n".to_string(),
+            }),
+            create_dir: None,
+            copy_file: None,
+            run: None,
+        }];
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_setup_copy_file() {
+        let mut test = make_test("read_copied_file", "cat", vec!["dest.txt"]);
+        test.expect.stdout = Some(OutputMatch::Exact("original content\n".to_string()));
+        let mut spec = make_spec(test);
+        spec.setup = vec![
+            SetupStep {
+                write_file: Some(WriteFile {
+                    path: PathBuf::from("source.txt"),
+                    contents: "original content\n".to_string(),
+                }),
+                create_dir: None,
+                copy_file: None,
+                run: None,
+            },
+            SetupStep {
+                write_file: None,
+                create_dir: None,
+                copy_file: Some(CopyFile {
+                    from: PathBuf::from("source.txt"),
+                    to: PathBuf::from("dest.txt"),
+                }),
+                run: None,
+            },
+        ];
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_setup_run_command() {
+        let mut test = make_test("check_setup_command", "cat", vec!["created_by_setup.txt"]);
+        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: Some("setup ran".to_string()),
+            regex: None,
+        }));
+        let mut spec = make_spec(test);
+        spec.setup = vec![SetupStep {
+            write_file: None,
+            create_dir: None,
+            copy_file: None,
+            run: Some(RunStep {
+                cmd: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo 'setup ran' > created_by_setup.txt".to_string(),
+                ],
+            }),
+        }];
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_teardown_removes_file() {
+        let mut test = make_test("create_file", "touch", vec!["to_remove.txt"]);
+        test.expect.files = vec![FileExpect {
+            path: PathBuf::from("to_remove.txt"),
+            exists: Some(true),
+            contents: None,
+        }];
+        let mut spec = make_spec(test);
+        spec.teardown = vec![TeardownStep {
+            remove_dir: None,
+            remove_file: Some(PathBuf::from("to_remove.txt")),
+            run: None,
+        }];
+        let result = run_spec(&spec);
+
+        // Test should pass (file existed when checked)
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+        // No teardown errors
+        assert!(
+            result
+                .tests
+                .iter()
+                .all(|t| t.name != "<teardown>" || t.passed)
+        );
+    }
+
+    // ==================== Environment Variable Tests ====================
+
+    #[test]
+    fn test_sandbox_env() {
+        let mut test = make_test("env_test", "sh", vec!["-c", "echo $MY_VAR"]);
+        test.expect.stdout = Some(OutputMatch::Exact("test_value\n".to_string()));
+        let mut spec = make_spec(test);
+        spec.sandbox
+            .env
+            .insert("MY_VAR".to_string(), "test_value".to_string());
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_command_env_override() {
+        let mut test = make_test("env_override", "sh", vec!["-c", "echo $MY_VAR"]);
+        test.expect.stdout = Some(OutputMatch::Exact("overridden\n".to_string()));
+        test.run
+            .env
+            .insert("MY_VAR".to_string(), "overridden".to_string());
+        let mut spec = make_spec(test);
+        spec.sandbox
+            .env
+            .insert("MY_VAR".to_string(), "original".to_string());
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_env_cleared_without_inherit() {
+        // When inherit_env is false (default), custom host env vars should not be visible
+        // Note: We use a custom var because sh may set default PATH even with cleared env
+        let mut test = make_test(
+            "env_cleared",
+            "sh",
+            vec!["-c", "echo ${BINTEST_CUSTOM_VAR:-empty}"],
+        );
+        test.expect.stdout = Some(OutputMatch::Exact("empty\n".to_string()));
+        let spec = make_spec(test);
+        // Even if BINTEST_CUSTOM_VAR is set in the host, it shouldn't be inherited
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    // ==================== Stdin Tests ====================
+
+    #[test]
+    fn test_stdin() {
+        let mut test = make_test("stdin_test", "cat", vec![]);
+        test.run.stdin = Some("input data".to_string());
+        test.expect.stdout = Some(OutputMatch::Exact("input data".to_string()));
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    // ==================== Shell Mode Tests ====================
+
+    #[test]
+    fn test_shell_mode() {
+        let mut test = make_test("shell_test", "echo", vec!["hello", "&&", "echo", "world"]);
+        test.run.shell = true;
+        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: Some("hello".to_string()),
+            regex: None,
+        }));
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    // ==================== Timeout Tests ====================
+
+    #[test]
+    fn test_timeout() {
+        let mut test = make_test("timeout_test", "sleep", vec!["10"]);
+        test.timeout = Some(1); // 1 second timeout
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("timed out"));
+    }
+
+    // ==================== Multiple Tests ====================
+
+    #[test]
+    fn test_multiple_tests_in_spec() {
+        let test1 = make_test("test_one", "echo", vec!["one"]);
+        let test2 = make_test("test_two", "echo", vec!["two"]);
+        let spec = TestSpec {
+            version: 1,
+            sandbox: Sandbox::default(),
+            setup: vec![],
+            tests: vec![test1, test2],
+            teardown: vec![],
+        };
+        let result = run_spec(&spec);
+
+        assert_eq!(result.tests.len(), 2);
+        assert!(result.tests[0].passed);
+        assert!(result.tests[1].passed);
+        assert_eq!(result.tests[0].name, "test_one");
+        assert_eq!(result.tests[1].name, "test_two");
+    }
+
+    #[test]
+    fn test_shared_sandbox_between_tests() {
+        // First test creates a file, second test reads it
+        let mut test1 = make_test("create_file", "sh", vec!["-c", "echo shared > shared.txt"]);
+        test1.expect.exit = Some(0);
+        let mut test2 = make_test("read_file", "cat", vec!["shared.txt"]);
+        test2.expect.stdout = Some(OutputMatch::Exact("shared\n".to_string()));
+        let spec = TestSpec {
+            version: 1,
+            sandbox: Sandbox::default(),
+            setup: vec![],
+            tests: vec![test1, test2],
+            teardown: vec![],
+        };
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "test1 failures: {:?}",
+            result.tests[0].failures
+        );
+        assert!(
+            result.tests[1].passed,
+            "test2 failures: {:?}",
+            result.tests[1].failures
+        );
+    }
+
+    // ==================== Working Directory Tests ====================
+
+    #[test]
+    fn test_custom_cwd() {
+        let mut test = make_test("cwd_test", "pwd", vec![]);
+        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: Some("subdir".to_string()),
+            regex: None,
+        }));
+        test.run.cwd = Some(PathBuf::from("subdir"));
+        let mut spec = make_spec(test);
+        spec.setup = vec![SetupStep {
+            write_file: None,
+            create_dir: Some(PathBuf::from("subdir")),
+            copy_file: None,
+            run: None,
+        }];
+        let result = run_spec(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    // ==================== Command Not Found ====================
+
+    #[test]
+    fn test_command_not_found() {
+        let test = make_test("not_found", "nonexistent_command_12345", vec![]);
+        let spec = make_spec(test);
+        let result = run_spec(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("Failed to spawn"));
+    }
+}
