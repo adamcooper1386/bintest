@@ -54,6 +54,22 @@ fn main() {
 
     match cli.command {
         Command::Run { path, output } => {
+            // Determine the test root directory for suite config
+            let test_root = if path.is_file() {
+                path.parent().unwrap_or(&path)
+            } else {
+                &path
+            };
+
+            // Load suite config if present
+            let suite_config = match loader::load_suite_config(test_root) {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("Error loading suite config: {e}");
+                    std::process::exit(1);
+                }
+            };
+
             let specs = match loader::find_specs(&path) {
                 Ok(s) => s,
                 Err(e) => {
@@ -64,6 +80,14 @@ fn main() {
 
             if specs.is_empty() {
                 eprintln!("No spec files found at: {}", path.display());
+                std::process::exit(1);
+            }
+
+            // Run suite-level setup if configured
+            if let Some(ref config) = suite_config
+                && let Err(e) = runner::run_suite_setup(config)
+            {
+                eprintln!("Suite setup failed: {e}");
                 std::process::exit(1);
             }
 
@@ -83,7 +107,7 @@ fn main() {
                     }
                 };
 
-                let result = runner::run_spec(&spec);
+                let result = runner::run_spec(&spec, suite_config.as_ref());
 
                 match output {
                     OutputFormat::Human => {
@@ -115,6 +139,16 @@ fn main() {
                         }));
                     }
                 }
+            }
+
+            // Run suite-level teardown if configured (always runs)
+            if let Some(ref config) = suite_config
+                && let Err(e) = runner::run_suite_teardown(config)
+            {
+                if matches!(output, OutputFormat::Human) {
+                    eprintln!("Suite teardown failed: {e}");
+                }
+                total_failed += 1;
             }
 
             match output {

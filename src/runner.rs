@@ -4,7 +4,7 @@
 
 use crate::schema::{
     Expect, FileExpect, OutputMatch, OutputMatchStructured, Run, RunStep, Sandbox, SetupStep,
-    TeardownStep, Test, TestSpec, WorkDir,
+    SuiteConfig, TeardownStep, Test, TestSpec, WorkDir,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -36,6 +36,32 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_f64(duration.as_secs_f64())
+}
+
+/// Run suite-level setup steps.
+///
+/// Creates a temporary context for suite setup (uses temp directory).
+pub fn run_suite_setup(config: &SuiteConfig) -> Result<(), String> {
+    if config.setup.is_empty() {
+        return Ok(());
+    }
+
+    let ctx = ExecutionContext::new(&Sandbox::default())
+        .map_err(|e| format!("Failed to create suite context: {e}"))?;
+    run_setup_steps(&config.setup, &ctx)
+}
+
+/// Run suite-level teardown steps.
+///
+/// Creates a temporary context for suite teardown (uses temp directory).
+pub fn run_suite_teardown(config: &SuiteConfig) -> Result<(), String> {
+    if config.teardown.is_empty() {
+        return Ok(());
+    }
+
+    let ctx = ExecutionContext::new(&Sandbox::default())
+        .map_err(|e| format!("Failed to create suite context: {e}"))?;
+    run_teardown_steps(&config.teardown, &ctx)
 }
 
 /// Context for test execution within a sandbox.
@@ -77,9 +103,56 @@ impl ExecutionContext {
     }
 }
 
-/// Run a test specification file.
-pub fn run_spec(spec: &TestSpec) -> SpecResult {
-    let ctx = match ExecutionContext::new(&spec.sandbox) {
+/// Effective configuration for running a spec, combining suite and file settings.
+#[derive(Debug, Clone, Default)]
+pub struct EffectiveConfig {
+    /// Default timeout (from suite or file).
+    pub default_timeout: Option<u64>,
+    /// Additional environment variables from suite config.
+    pub suite_env: HashMap<String, String>,
+    /// Whether to inherit env from host (suite-level default).
+    pub inherit_env: Option<bool>,
+}
+
+impl EffectiveConfig {
+    /// Create from optional suite config.
+    pub fn from_suite(suite: Option<&SuiteConfig>) -> Self {
+        match suite {
+            Some(cfg) => Self {
+                default_timeout: cfg.timeout,
+                suite_env: cfg.env.clone(),
+                inherit_env: cfg.inherit_env,
+            },
+            None => Self::default(),
+        }
+    }
+}
+
+/// Run a test specification file with optional suite configuration.
+pub fn run_spec(spec: &TestSpec, suite_config: Option<&SuiteConfig>) -> SpecResult {
+    let effective = EffectiveConfig::from_suite(suite_config);
+    run_spec_with_config(spec, &effective)
+}
+
+/// Run a test specification file with effective configuration.
+fn run_spec_with_config(spec: &TestSpec, effective: &EffectiveConfig) -> SpecResult {
+    // Merge suite env with sandbox env (sandbox takes precedence)
+    let mut merged_sandbox = spec.sandbox.clone();
+    for (k, v) in &effective.suite_env {
+        merged_sandbox.env.entry(k.clone()).or_insert(v.clone());
+    }
+    // Apply suite-level inherit_env if file doesn't specify differently
+    if let Some(inherit) = effective.inherit_env {
+        // Only override if sandbox has default (false)
+        if !merged_sandbox.inherit_env {
+            merged_sandbox.inherit_env = inherit;
+        }
+    }
+
+    // Determine file-level default timeout
+    let file_timeout = spec.timeout.or(effective.default_timeout);
+
+    let ctx = match ExecutionContext::new(&merged_sandbox) {
         Ok(ctx) => ctx,
         Err(e) => {
             return SpecResult {
@@ -108,7 +181,7 @@ pub fn run_spec(spec: &TestSpec) -> SpecResult {
     // Run tests
     let mut results = Vec::new();
     for test in &spec.tests {
-        let result = run_test(test, &ctx);
+        let result = run_test(test, &ctx, file_timeout);
         results.push(result);
     }
 
@@ -125,7 +198,7 @@ pub fn run_spec(spec: &TestSpec) -> SpecResult {
     SpecResult { tests: results }
 }
 
-fn run_test(test: &Test, ctx: &ExecutionContext) -> TestResult {
+fn run_test(test: &Test, ctx: &ExecutionContext, file_timeout: Option<u64>) -> TestResult {
     let start = Instant::now();
     let mut failures = Vec::new();
 
@@ -139,8 +212,12 @@ fn run_test(test: &Test, ctx: &ExecutionContext) -> TestResult {
         };
     }
 
-    // Run the command
-    let timeout = Duration::from_secs(test.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
+    // Run the command - test timeout overrides file timeout overrides default
+    let timeout_secs = test
+        .timeout
+        .or(file_timeout)
+        .unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(timeout_secs);
     match run_command(&test.run, ctx, timeout) {
         Ok(output) => {
             // Check assertions
@@ -495,10 +572,16 @@ mod tests {
         TestSpec {
             version: 1,
             sandbox: Sandbox::default(),
+            timeout: None,
             setup: vec![],
             tests: vec![test],
             teardown: vec![],
         }
+    }
+
+    /// Helper to run a spec without suite config (for backwards compat in tests).
+    fn run_spec_standalone(spec: &TestSpec) -> SpecResult {
+        run_spec(spec, None)
     }
 
     /// Helper to create a minimal test with a command.
@@ -528,7 +611,7 @@ mod tests {
     fn test_simple_echo() {
         let test = make_test("echo_test", "echo", vec!["hello"]);
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert_eq!(result.tests.len(), 1);
         assert!(
@@ -544,7 +627,7 @@ mod tests {
         let mut test = make_test("exit_zero", "true", vec![]);
         test.expect.exit = Some(0);
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -558,7 +641,7 @@ mod tests {
         let mut test = make_test("exit_one", "false", vec![]);
         test.expect.exit = Some(1);
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -572,7 +655,7 @@ mod tests {
         let mut test = make_test("exit_mismatch", "true", vec![]);
         test.expect.exit = Some(1); // Expecting 1 but will get 0
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(!result.tests[0].passed);
         assert!(result.tests[0].failures[0].contains("Exit code"));
@@ -585,7 +668,7 @@ mod tests {
         let mut test = make_test("stdout_exact", "echo", vec!["hello"]);
         test.expect.stdout = Some(OutputMatch::Exact("hello\n".to_string()));
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -599,7 +682,7 @@ mod tests {
         let mut test = make_test("stdout_exact_fail", "echo", vec!["hello"]);
         test.expect.stdout = Some(OutputMatch::Exact("world\n".to_string()));
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(!result.tests[0].passed);
         assert!(result.tests[0].failures[0].contains("expected exact match"));
@@ -614,7 +697,7 @@ mod tests {
             regex: None,
         }));
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -632,7 +715,7 @@ mod tests {
             regex: None,
         }));
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(!result.tests[0].passed);
         assert!(result.tests[0].failures[0].contains("expected to contain"));
@@ -647,7 +730,7 @@ mod tests {
             regex: Some(r"hello\d+world".to_string()),
         }));
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -665,7 +748,7 @@ mod tests {
             regex: Some(r"\d+".to_string()),
         }));
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(!result.tests[0].passed);
         assert!(result.tests[0].failures[0].contains("expected to match regex"));
@@ -680,7 +763,7 @@ mod tests {
             regex: Some(r"[invalid".to_string()),
         }));
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(!result.tests[0].passed);
         assert!(result.tests[0].failures[0].contains("invalid regex"));
@@ -697,7 +780,7 @@ mod tests {
             regex: None,
         }));
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -717,7 +800,7 @@ mod tests {
             contents: None,
         }];
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -735,7 +818,7 @@ mod tests {
             contents: None,
         }];
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -753,7 +836,7 @@ mod tests {
             contents: None,
         }];
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(!result.tests[0].passed);
         assert!(result.tests[0].failures[0].contains("should exist"));
@@ -768,7 +851,7 @@ mod tests {
             contents: Some(OutputMatch::Exact("hello\n".to_string())),
         }];
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -794,7 +877,7 @@ mod tests {
             })),
         }];
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -819,7 +902,7 @@ mod tests {
             copy_file: None,
             run: None,
         }];
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -839,7 +922,7 @@ mod tests {
             copy_file: None,
             run: None,
         }];
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -862,7 +945,7 @@ mod tests {
             run: None,
         }];
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -896,7 +979,7 @@ mod tests {
                 run: None,
             },
         ];
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -926,7 +1009,7 @@ mod tests {
                 ],
             }),
         }];
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -949,7 +1032,7 @@ mod tests {
             remove_file: Some(PathBuf::from("to_remove.txt")),
             run: None,
         }];
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         // Test should pass (file existed when checked)
         assert!(
@@ -976,7 +1059,7 @@ mod tests {
         spec.sandbox
             .env
             .insert("MY_VAR".to_string(), "test_value".to_string());
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -996,7 +1079,7 @@ mod tests {
         spec.sandbox
             .env
             .insert("MY_VAR".to_string(), "original".to_string());
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -1017,7 +1100,7 @@ mod tests {
         test.expect.stdout = Some(OutputMatch::Exact("empty\n".to_string()));
         let spec = make_spec(test);
         // Even if BINTEST_CUSTOM_VAR is set in the host, it shouldn't be inherited
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -1034,7 +1117,7 @@ mod tests {
         test.run.stdin = Some("input data".to_string());
         test.expect.stdout = Some(OutputMatch::Exact("input data".to_string()));
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -1055,7 +1138,7 @@ mod tests {
             regex: None,
         }));
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -1071,7 +1154,7 @@ mod tests {
         let mut test = make_test("timeout_test", "sleep", vec!["10"]);
         test.timeout = Some(1); // 1 second timeout
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(!result.tests[0].passed);
         assert!(result.tests[0].failures[0].contains("timed out"));
@@ -1086,11 +1169,12 @@ mod tests {
         let spec = TestSpec {
             version: 1,
             sandbox: Sandbox::default(),
+            timeout: None,
             setup: vec![],
             tests: vec![test1, test2],
             teardown: vec![],
         };
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert_eq!(result.tests.len(), 2);
         assert!(result.tests[0].passed);
@@ -1109,11 +1193,12 @@ mod tests {
         let spec = TestSpec {
             version: 1,
             sandbox: Sandbox::default(),
+            timeout: None,
             setup: vec![],
             tests: vec![test1, test2],
             teardown: vec![],
         };
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -1145,7 +1230,7 @@ mod tests {
             copy_file: None,
             run: None,
         }];
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(
             result.tests[0].passed,
@@ -1160,9 +1245,122 @@ mod tests {
     fn test_command_not_found() {
         let test = make_test("not_found", "nonexistent_command_12345", vec![]);
         let spec = make_spec(test);
-        let result = run_spec(&spec);
+        let result = run_spec_standalone(&spec);
 
         assert!(!result.tests[0].passed);
         assert!(result.tests[0].failures[0].contains("Failed to spawn"));
+    }
+
+    // ==================== Suite Config Tests ====================
+
+    #[test]
+    fn test_suite_config_timeout() {
+        // Suite config sets 1 second timeout, test should timeout
+        let suite_config = SuiteConfig {
+            version: 1,
+            timeout: Some(1),
+            env: HashMap::new(),
+            inherit_env: None,
+            setup: vec![],
+            teardown: vec![],
+        };
+
+        let test = make_test("slow_test", "sleep", vec!["10"]);
+        let spec = make_spec(test);
+        let result = run_spec(&spec, Some(&suite_config));
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("timed out"));
+    }
+
+    #[test]
+    fn test_suite_config_env() {
+        // Suite config provides environment variable
+        let mut suite_env = HashMap::new();
+        suite_env.insert("SUITE_VAR".to_string(), "from_suite".to_string());
+
+        let suite_config = SuiteConfig {
+            version: 1,
+            timeout: None,
+            env: suite_env,
+            inherit_env: None,
+            setup: vec![],
+            teardown: vec![],
+        };
+
+        let mut test = make_test("env_test", "sh", vec!["-c", "echo $SUITE_VAR"]);
+        test.expect.stdout = Some(OutputMatch::Exact("from_suite\n".to_string()));
+        let spec = make_spec(test);
+        let result = run_spec(&spec, Some(&suite_config));
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_file_env_overrides_suite_env() {
+        // File-level env should override suite-level env
+        let mut suite_env = HashMap::new();
+        suite_env.insert("MY_VAR".to_string(), "from_suite".to_string());
+
+        let suite_config = SuiteConfig {
+            version: 1,
+            timeout: None,
+            env: suite_env,
+            inherit_env: None,
+            setup: vec![],
+            teardown: vec![],
+        };
+
+        let mut test = make_test("env_override", "sh", vec!["-c", "echo $MY_VAR"]);
+        test.expect.stdout = Some(OutputMatch::Exact("from_file\n".to_string()));
+        let mut spec = make_spec(test);
+        spec.sandbox
+            .env
+            .insert("MY_VAR".to_string(), "from_file".to_string());
+        let result = run_spec(&spec, Some(&suite_config));
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_file_timeout_overrides_suite_timeout() {
+        // File-level timeout should override suite-level timeout
+        let suite_config = SuiteConfig {
+            version: 1,
+            timeout: Some(10), // Suite says 10 seconds
+            env: HashMap::new(),
+            inherit_env: None,
+            setup: vec![],
+            teardown: vec![],
+        };
+
+        let test = make_test("timeout_test", "sleep", vec!["5"]);
+        let mut spec = make_spec(test);
+        spec.timeout = Some(1); // File says 1 second
+        let result = run_spec(&spec, Some(&suite_config));
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("timed out"));
+    }
+
+    #[test]
+    fn test_test_timeout_overrides_file_timeout() {
+        // Test-level timeout should override file-level timeout
+        let mut test = make_test("timeout_test", "sleep", vec!["5"]);
+        test.timeout = Some(1); // Test says 1 second
+        let mut spec = make_spec(test);
+        spec.timeout = Some(10); // File says 10 seconds
+        let result = run_spec_standalone(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("timed out"));
     }
 }

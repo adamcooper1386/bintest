@@ -8,6 +8,40 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Suite-level configuration loaded from `bintest.yaml` in the test root.
+///
+/// Provides defaults that apply to all spec files in the suite.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SuiteConfig {
+    /// Schema version (must match crate major version).
+    #[serde(default = "default_version")]
+    pub version: u32,
+
+    /// Default timeout in seconds for all tests (can be overridden at file/test level).
+    #[serde(default)]
+    pub timeout: Option<u64>,
+
+    /// Default environment variables for all tests.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+
+    /// Whether to inherit environment from host by default.
+    #[serde(default)]
+    pub inherit_env: Option<bool>,
+
+    /// Setup steps run before the entire suite.
+    #[serde(default)]
+    pub setup: Vec<SetupStep>,
+
+    /// Teardown steps run after the entire suite.
+    #[serde(default)]
+    pub teardown: Vec<TeardownStep>,
+}
+
+fn default_version() -> u32 {
+    1
+}
+
 /// Root document for a test specification file.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TestSpec {
@@ -17,6 +51,10 @@ pub struct TestSpec {
     /// Sandbox configuration for this spec file.
     #[serde(default)]
     pub sandbox: Sandbox,
+
+    /// Default timeout in seconds for tests in this file.
+    #[serde(default)]
+    pub timeout: Option<u64>,
 
     /// Setup steps run before all tests in this file.
     #[serde(default)]

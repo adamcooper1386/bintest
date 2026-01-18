@@ -2,7 +2,7 @@
 //!
 //! Loads and parses test specification files from disk.
 
-use crate::schema::TestSpec;
+use crate::schema::{SuiteConfig, TestSpec};
 use std::path::Path;
 
 /// Error type for spec loading operations.
@@ -30,6 +30,9 @@ impl std::fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+/// The name of the suite configuration file.
+pub const SUITE_CONFIG_FILENAME: &str = "bintest.yaml";
+
 /// Load a test spec from a file path.
 pub fn load_spec(path: &Path) -> Result<TestSpec, LoadError> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -41,6 +44,22 @@ pub fn load_spec(path: &Path) -> Result<TestSpec, LoadError> {
         }
         other => Err(LoadError::UnsupportedFormat(other.to_string())),
     }
+}
+
+/// Load suite configuration from a directory.
+///
+/// Looks for `bintest.yaml` in the given directory.
+/// Returns `None` if the file doesn't exist, `Err` if it exists but is invalid.
+pub fn load_suite_config(dir: &Path) -> Result<Option<SuiteConfig>, LoadError> {
+    let config_path = dir.join(SUITE_CONFIG_FILENAME);
+
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(&config_path).map_err(LoadError::Io)?;
+    let config: SuiteConfig = serde_yaml::from_str(&contents).map_err(LoadError::Yaml)?;
+    Ok(Some(config))
 }
 
 /// Find all spec files in a directory or return the single file.
@@ -68,6 +87,10 @@ fn collect_specs_recursive(
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
             && (ext == "yaml" || ext == "yml")
         {
+            // Skip suite config file
+            if path.file_name().is_some_and(|f| f == SUITE_CONFIG_FILENAME) {
+                continue;
+            }
             specs.push(path);
         }
     }
@@ -133,5 +156,52 @@ tests:
 
         let specs = find_specs(dir.path()).unwrap();
         assert_eq!(specs.len(), 2);
+    }
+
+    #[test]
+    fn find_specs_excludes_bintest_yaml() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.yaml"), "").unwrap();
+        std::fs::write(dir.path().join("bintest.yaml"), "version: 1").unwrap();
+
+        let specs = find_specs(dir.path()).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert!(specs[0].file_name().unwrap() != "bintest.yaml");
+    }
+
+    #[test]
+    fn load_suite_config_not_found() {
+        let dir = tempdir().unwrap();
+        let result = load_suite_config(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_suite_config_valid() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bintest.yaml"),
+            r#"
+version: 1
+timeout: 10
+env:
+  MY_VAR: my_value
+"#,
+        )
+        .unwrap();
+
+        let config = load_suite_config(dir.path()).unwrap().unwrap();
+        assert_eq!(config.version, 1);
+        assert_eq!(config.timeout, Some(10));
+        assert_eq!(config.env.get("MY_VAR"), Some(&"my_value".to_string()));
+    }
+
+    #[test]
+    fn load_suite_config_invalid() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("bintest.yaml"), "invalid: [yaml: {").unwrap();
+
+        let result = load_suite_config(dir.path());
+        assert!(matches!(result, Err(LoadError::Yaml(_))));
     }
 }

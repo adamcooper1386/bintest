@@ -1,0 +1,42 @@
+# Test that file-level settings override suite-level settings
+
+version: 1
+
+# File-level timeout overrides suite timeout (5s -> 2s)
+timeout: 2
+
+sandbox:
+  env:
+    # This overrides the suite-level LOG_LEVEL
+    LOG_LEVEL: warn
+
+tests:
+  - name: file_env_overrides_suite
+    run:
+      cmd: sh
+      args: ["-c", "echo $LOG_LEVEL"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "warn"
+
+  - name: suite_env_still_available
+    description: Suite env vars not overridden are still available
+    run:
+      cmd: sh
+      args: ["-c", "echo $SUITE_NAME"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "example-suite"
+
+  - name: test_level_timeout
+    description: Test-level timeout can be set independently
+    timeout: 3
+    run:
+      cmd: echo
+      args: ["test timeout works"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "timeout works"

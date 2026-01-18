@@ -1,0 +1,24 @@
+# Suite-level configuration
+# This file applies defaults to all test specs in this directory
+
+version: 1
+
+# Default timeout for all tests (can be overridden at file/test level)
+timeout: 5
+
+# Environment variables available to all tests
+env:
+  SUITE_NAME: example-suite
+  LOG_LEVEL: debug
+
+# Suite setup runs once before all spec files
+setup:
+  - run:
+      cmd: echo
+      args: ["Suite starting..."]
+
+# Suite teardown runs once after all spec files
+teardown:
+  - run:
+      cmd: echo
+      args: ["Suite complete!"]

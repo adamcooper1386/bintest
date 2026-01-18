@@ -1,0 +1,22 @@
+# Test that suite-level environment variables are available
+
+version: 1
+
+tests:
+  - name: suite_env_available
+    run:
+      cmd: sh
+      args: ["-c", "echo $SUITE_NAME"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "example-suite"
+
+  - name: suite_log_level
+    run:
+      cmd: sh
+      args: ["-c", "echo $LOG_LEVEL"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "debug"
