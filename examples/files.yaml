@@ -1,0 +1,33 @@
+version: 1
+
+sandbox:
+  workdir: temp
+
+setup:
+  - write_file:
+      path: input.txt
+      contents: "Hello, World!"
+
+tests:
+  - name: read_file
+    run:
+      cmd: cat
+      args: ["input.txt"]
+    expect:
+      exit: 0
+      stdout: "Hello, World!"
+      files:
+        - path: input.txt
+          exists: true
+
+  - name: write_and_verify
+    run:
+      cmd: sh
+      args: ["-c", "echo 'new content' > output.txt"]
+    expect:
+      exit: 0
+      files:
+        - path: output.txt
+          exists: true
+          contents:
+            contains: "new content"

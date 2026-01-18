@@ -1,0 +1,28 @@
+version: 1
+
+sandbox:
+  workdir: temp
+
+tests:
+  - name: exit_code_failure
+    run:
+      cmd: sh
+      args: ["-c", "exit 1"]
+    expect:
+      exit: 1
+
+  - name: command_not_found
+    run:
+      cmd: nonexistent_command_12345
+    expect:
+      exit: 127
+
+  - name: intentional_stdout_mismatch
+    description: "This test demonstrates a failing assertion"
+    run:
+      cmd: echo
+      args: ["actual output"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "expected output"

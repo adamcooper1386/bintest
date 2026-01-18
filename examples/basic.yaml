@@ -1,0 +1,22 @@
+version: 1
+
+sandbox:
+  workdir: temp
+
+tests:
+  - name: echo_hello
+    run:
+      cmd: echo
+      args: ["hello", "world"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "hello"
+
+  - name: echo_exact
+    run:
+      cmd: echo
+      args: ["test"]
+    expect:
+      exit: 0
+      stdout: "test\n"
