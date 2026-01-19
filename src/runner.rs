@@ -2,9 +2,10 @@
 //!
 //! Runs test specs in isolated sandboxes and captures results.
 
+use crate::database::ConnectionManager;
 use crate::schema::{
-    Expect, FileExpect, OutputMatch, OutputMatchStructured, Run, RunStep, Sandbox, SandboxDir,
-    SetupStep, SuiteConfig, TeardownStep, Test, TestSpec, TreeExpect, WorkDir,
+    DatabaseConfig, Expect, FileExpect, OutputMatch, OutputMatchStructured, Run, RunStep, Sandbox,
+    SandboxDir, SetupStep, SuiteConfig, TeardownStep, Test, TestSpec, TreeExpect, WorkDir,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -158,6 +159,8 @@ pub struct EffectiveConfig {
     pub capture_fs_diff: bool,
     /// Directory for test sandboxes (from suite config or CLI).
     pub sandbox_dir: Option<SandboxDir>,
+    /// Suite-level database configurations.
+    pub databases: HashMap<String, DatabaseConfig>,
 }
 
 impl EffectiveConfig {
@@ -170,6 +173,7 @@ impl EffectiveConfig {
                 inherit_env: cfg.inherit_env,
                 capture_fs_diff: cfg.capture_fs_diff,
                 sandbox_dir: cfg.sandbox_dir.clone(),
+                databases: cfg.databases.clone(),
             },
             None => Self::default(),
         }
@@ -232,6 +236,15 @@ fn run_spec_with_config(
             };
         }
     };
+
+    // Merge database configurations (file-level overrides suite-level)
+    let mut merged_databases = effective.databases.clone();
+    for (name, config) in &spec.databases {
+        merged_databases.insert(name.clone(), config.clone());
+    }
+
+    // Create connection manager (connections are lazy, opened on first use)
+    let _db_manager = ConnectionManager::new(merged_databases);
 
     // Run file-level setup
     if let Err(e) = run_setup_steps(&spec.setup, &ctx) {
@@ -1068,6 +1081,7 @@ mod tests {
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
+            databases: HashMap::new(),
             setup: vec![],
             tests: vec![test],
             teardown: vec![],
@@ -1817,6 +1831,7 @@ mod tests {
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
+            databases: HashMap::new(),
             setup: vec![],
             tests: vec![test1, test2],
             teardown: vec![],
@@ -1845,6 +1860,7 @@ mod tests {
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
+            databases: HashMap::new(),
             setup: vec![],
             tests: vec![test1, test2],
             teardown: vec![],
@@ -1916,6 +1932,7 @@ mod tests {
             serial: false,
             capture_fs_diff: false,
             sandbox_dir: None,
+            databases: HashMap::new(),
             setup: vec![],
             teardown: vec![],
         };
@@ -1942,6 +1959,7 @@ mod tests {
             serial: false,
             capture_fs_diff: false,
             sandbox_dir: None,
+            databases: HashMap::new(),
             setup: vec![],
             teardown: vec![],
         };
@@ -1972,6 +1990,7 @@ mod tests {
             serial: false,
             capture_fs_diff: false,
             sandbox_dir: None,
+            databases: HashMap::new(),
             setup: vec![],
             teardown: vec![],
         };
@@ -2002,6 +2021,7 @@ mod tests {
             serial: false,
             capture_fs_diff: false,
             sandbox_dir: None,
+            databases: HashMap::new(),
             setup: vec![],
             teardown: vec![],
         };
@@ -2043,6 +2063,7 @@ mod tests {
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
+            databases: HashMap::new(),
             setup: vec![],
             tests: vec![test1, test2],
             teardown: vec![],
@@ -2077,6 +2098,7 @@ mod tests {
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
+            databases: HashMap::new(),
             setup: vec![],
             tests: vec![test1, test2],
             teardown: vec![],
@@ -2121,6 +2143,7 @@ mod tests {
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
+            databases: HashMap::new(),
             setup: vec![],
             tests: vec![serial_test, parallel_test],
             teardown: vec![],
@@ -2155,6 +2178,7 @@ mod tests {
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
+            databases: HashMap::new(),
             setup: vec![],
             tests: vec![test1, test2, test3],
             teardown: vec![],
@@ -2185,6 +2209,7 @@ mod tests {
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
+            databases: HashMap::new(),
             setup: vec![],
             tests: vec![s1, p1, s2, p2],
             teardown: vec![],
@@ -2464,6 +2489,7 @@ mod tests {
             serial: false,
             capture_fs_diff: false,
             sandbox_dir: Some(SandboxDir::Local),
+            databases: HashMap::new(),
             setup: vec![],
             teardown: vec![],
         };

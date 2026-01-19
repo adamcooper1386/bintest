@@ -45,6 +45,11 @@ pub struct SuiteConfig {
     #[serde(default)]
     pub sandbox_dir: Option<SandboxDir>,
 
+    /// Database connections available for SQL assertions and setup/teardown.
+    /// Keys are connection names (e.g., "default", "root").
+    #[serde(default)]
+    pub databases: HashMap<String, DatabaseConfig>,
+
     /// Setup steps run before the entire suite.
     #[serde(default)]
     pub setup: Vec<SetupStep>,
@@ -104,6 +109,11 @@ pub struct TestSpec {
     /// Capture filesystem diffs for tests in this file (overrides suite setting).
     #[serde(default)]
     pub capture_fs_diff: Option<bool>,
+
+    /// Database connections for this spec file.
+    /// Merges with suite-level databases (file-level overrides suite-level).
+    #[serde(default)]
+    pub databases: HashMap<String, DatabaseConfig>,
 
     /// Setup steps run before all tests in this file.
     #[serde(default)]
@@ -544,6 +554,39 @@ pub struct TreeEntry {
     pub contents: Option<OutputMatch>,
 }
 
+// ============================================================================
+// Database Configuration Types
+// ============================================================================
+
+/// Database driver type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DbDriver {
+    /// PostgreSQL database.
+    Postgres,
+    /// SQLite database (including `:memory:`).
+    Sqlite,
+}
+
+/// Database connection configuration.
+///
+/// Defines how to connect to a database. URLs support environment variable
+/// interpolation using `${VAR}` syntax.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DatabaseConfig {
+    /// The database driver to use.
+    pub driver: DbDriver,
+
+    /// Connection URL. Supports `${VAR}` interpolation.
+    ///
+    /// Examples:
+    /// - `postgres://user:pass@localhost:5432/dbname`
+    /// - `sqlite:///path/to/file.db`
+    /// - `sqlite::memory:`
+    /// - `${DATABASE_URL}`
+    pub url: String,
+}
+
 /// Generate the JSON Schema for test specification files.
 pub fn generate_schema() -> schemars::schema::RootSchema {
     schemars::schema_for!(TestSpec)
@@ -749,5 +792,48 @@ tests:
         assert_eq!(spec.tests[1].steps.len(), 2);
         assert_eq!(spec.tests[1].steps[0].name, "step_one");
         assert_eq!(spec.tests[1].steps[1].name, "step_two");
+    }
+
+    #[test]
+    fn parse_database_config() {
+        let yaml = r#"
+version: 1
+
+databases:
+  default:
+    driver: postgres
+    url: "${DATABASE_URL}"
+  root:
+    driver: postgres
+    url: "postgres://admin:secret@localhost:5432/postgres"
+  sqlite_test:
+    driver: sqlite
+    url: "sqlite::memory:"
+
+tests:
+  - name: db_test
+    run:
+      cmd: echo
+      args: ["hello"]
+    expect:
+      exit: 0
+"#;
+        let spec: TestSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.databases.len(), 3);
+
+        let default_db = spec.databases.get("default").unwrap();
+        assert_eq!(default_db.driver, DbDriver::Postgres);
+        assert_eq!(default_db.url, "${DATABASE_URL}");
+
+        let root_db = spec.databases.get("root").unwrap();
+        assert_eq!(root_db.driver, DbDriver::Postgres);
+        assert_eq!(
+            root_db.url,
+            "postgres://admin:secret@localhost:5432/postgres"
+        );
+
+        let sqlite_db = spec.databases.get("sqlite_test").unwrap();
+        assert_eq!(sqlite_db.driver, DbDriver::Sqlite);
+        assert_eq!(sqlite_db.url, "sqlite::memory:");
     }
 }

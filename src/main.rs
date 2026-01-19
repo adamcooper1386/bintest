@@ -1,3 +1,4 @@
+mod database;
 mod loader;
 mod runner;
 mod schema;
