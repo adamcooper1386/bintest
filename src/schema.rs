@@ -236,8 +236,80 @@ pub struct RunStep {
     pub args: Vec<String>,
 }
 
-/// A single test case.
+/// A single step within a multi-step test.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Step {
+    /// Step name (used in failure reporting).
+    pub name: String,
+
+    /// Step-level setup steps.
+    #[serde(default)]
+    pub setup: Vec<SetupStep>,
+
+    /// The command to execute.
+    pub run: Run,
+
+    /// Expected outcomes.
+    #[serde(default)]
+    pub expect: Expect,
+
+    /// Step-level teardown steps.
+    #[serde(default)]
+    pub teardown: Vec<TeardownStep>,
+}
+
+/// Helper enum for deserializing both test formats.
+/// Only used during deserialization, not stored, so the size difference is acceptable.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
+enum TestFormat {
+    /// New format with explicit steps.
+    MultiStep {
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        setup: Vec<SetupStep>,
+        steps: Vec<Step>,
+        #[serde(default)]
+        teardown: Vec<TeardownStep>,
+        #[serde(default)]
+        timeout: Option<u64>,
+        #[serde(default)]
+        serial: bool,
+        #[serde(default)]
+        capture_fs_diff: Option<bool>,
+    },
+    /// Old format with single run/expect (implicit single step).
+    SingleStep {
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        setup: Vec<SetupStep>,
+        run: Run,
+        #[serde(default)]
+        expect: Expect,
+        #[serde(default)]
+        teardown: Vec<TeardownStep>,
+        #[serde(default)]
+        timeout: Option<u64>,
+        #[serde(default)]
+        serial: bool,
+        #[serde(default)]
+        capture_fs_diff: Option<bool>,
+    },
+}
+
+/// A single test case.
+///
+/// Tests can be defined in two formats:
+/// 1. Single-step (backward compatible): `run` + `expect` fields
+/// 2. Multi-step: `steps` array with named steps
+///
+/// Internally, single-step tests are converted to a single step named "run".
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Test {
     /// Unique name for this test.
     pub name: String,
@@ -246,17 +318,14 @@ pub struct Test {
     #[serde(default)]
     pub description: Option<String>,
 
-    /// Test-level setup steps.
+    /// Test-level setup steps (run once before all steps).
     #[serde(default)]
     pub setup: Vec<SetupStep>,
 
-    /// The command to execute.
-    pub run: Run,
+    /// The steps to execute. For single-step tests, this contains one step named "run".
+    pub steps: Vec<Step>,
 
-    /// Expected outcomes.
-    pub expect: Expect,
-
-    /// Test-level teardown steps.
+    /// Test-level teardown steps (run once after all steps).
     #[serde(default)]
     pub teardown: Vec<TeardownStep>,
 
@@ -271,6 +340,65 @@ pub struct Test {
     /// Capture filesystem diff for this test (overrides file/suite setting).
     #[serde(default)]
     pub capture_fs_diff: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for Test {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let format = TestFormat::deserialize(deserializer)?;
+        Ok(match format {
+            TestFormat::MultiStep {
+                name,
+                description,
+                setup,
+                steps,
+                teardown,
+                timeout,
+                serial,
+                capture_fs_diff,
+            } => Test {
+                name,
+                description,
+                setup,
+                steps,
+                teardown,
+                timeout,
+                serial,
+                capture_fs_diff,
+            },
+            TestFormat::SingleStep {
+                name,
+                description,
+                setup,
+                run,
+                expect,
+                teardown,
+                timeout,
+                serial,
+                capture_fs_diff,
+            } => {
+                // Convert single run/expect to a single step named "run"
+                Test {
+                    name,
+                    description,
+                    setup,
+                    steps: vec![Step {
+                        name: "run".to_string(),
+                        setup: vec![],
+                        run,
+                        expect,
+                        teardown: vec![],
+                    }],
+                    teardown,
+                    timeout,
+                    serial,
+                    capture_fs_diff,
+                }
+            }
+        })
+    }
 }
 
 /// Command execution configuration.
@@ -427,6 +555,9 @@ tests:
         assert_eq!(spec.version, 1);
         assert_eq!(spec.tests.len(), 1);
         assert_eq!(spec.tests[0].name, "simple_test");
+        // Single-step format is converted to a step named "run"
+        assert_eq!(spec.tests[0].steps.len(), 1);
+        assert_eq!(spec.tests[0].steps[0].name, "run");
     }
 
     #[test]
@@ -482,7 +613,8 @@ tests:
       stdout: "hello\n"
 "#;
         let spec: TestSpec = serde_yaml::from_str(yaml).unwrap();
-        match &spec.tests[0].expect.stdout {
+        // Access expect through the step
+        match &spec.tests[0].steps[0].expect.stdout {
             Some(OutputMatch::Exact(s)) => assert_eq!(s, "hello\n"),
             _ => panic!("Expected exact match"),
         }
@@ -502,11 +634,106 @@ tests:
         contains: "world"
 "#;
         let spec: TestSpec = serde_yaml::from_str(yaml).unwrap();
-        match &spec.tests[0].expect.stdout {
+        // Access expect through the step
+        match &spec.tests[0].steps[0].expect.stdout {
             Some(OutputMatch::Structured(s)) => {
                 assert_eq!(s.contains, Some("world".to_string()));
             }
             _ => panic!("Expected structured match"),
         }
+    }
+
+    #[test]
+    fn parse_multi_step_test() {
+        let yaml = r#"
+version: 1
+tests:
+  - name: workflow_test
+    setup:
+      - write_file:
+          path: initial.txt
+          contents: "start"
+    steps:
+      - name: initialize
+        run:
+          cmd: my_cli
+          args: ["init"]
+        expect:
+          exit: 0
+      - name: execute
+        setup:
+          - write_file:
+              path: config.json
+              contents: "{}"
+        run:
+          cmd: my_cli
+          args: ["run"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "success"
+    teardown:
+      - remove_file: initial.txt
+"#;
+        let spec: TestSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.tests.len(), 1);
+        let test = &spec.tests[0];
+        assert_eq!(test.name, "workflow_test");
+        assert_eq!(test.setup.len(), 1);
+        assert_eq!(test.teardown.len(), 1);
+        assert_eq!(test.steps.len(), 2);
+
+        // Check first step
+        assert_eq!(test.steps[0].name, "initialize");
+        assert_eq!(test.steps[0].run.cmd, "my_cli");
+        assert_eq!(test.steps[0].run.args, vec!["init"]);
+        assert!(test.steps[0].setup.is_empty());
+
+        // Check second step
+        assert_eq!(test.steps[1].name, "execute");
+        assert_eq!(test.steps[1].run.cmd, "my_cli");
+        assert_eq!(test.steps[1].run.args, vec!["run"]);
+        assert_eq!(test.steps[1].setup.len(), 1);
+    }
+
+    #[test]
+    fn parse_mixed_single_and_multi_step() {
+        let yaml = r#"
+version: 1
+tests:
+  - name: single_step_test
+    run:
+      cmd: echo
+      args: ["hello"]
+    expect:
+      exit: 0
+  - name: multi_step_test
+    steps:
+      - name: step_one
+        run:
+          cmd: echo
+          args: ["one"]
+        expect:
+          exit: 0
+      - name: step_two
+        run:
+          cmd: echo
+          args: ["two"]
+        expect:
+          exit: 0
+"#;
+        let spec: TestSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.tests.len(), 2);
+
+        // First test: single-step format converted to steps
+        assert_eq!(spec.tests[0].name, "single_step_test");
+        assert_eq!(spec.tests[0].steps.len(), 1);
+        assert_eq!(spec.tests[0].steps[0].name, "run");
+
+        // Second test: explicit multi-step format
+        assert_eq!(spec.tests[1].name, "multi_step_test");
+        assert_eq!(spec.tests[1].steps.len(), 2);
+        assert_eq!(spec.tests[1].steps[0].name, "step_one");
+        assert_eq!(spec.tests[1].steps[1].name, "step_two");
     }
 }

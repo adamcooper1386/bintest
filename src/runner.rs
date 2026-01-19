@@ -30,9 +30,21 @@ pub struct TestResult {
     #[serde(serialize_with = "serialize_duration")]
     pub duration: Duration,
     pub failures: Vec<String>,
+    /// Which step failed (None if test-level setup/teardown failed, or for single-step tests).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<StepFailure>,
     /// Filesystem changes during test execution (if capture_fs_diff enabled).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_diff: Option<FilesystemDiff>,
+}
+
+/// Information about which step failed in a multi-step test.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StepFailure {
+    /// Step name.
+    pub name: String,
+    /// Step index (0-based).
+    pub index: usize,
 }
 
 /// Filesystem changes captured during test execution.
@@ -214,6 +226,7 @@ fn run_spec_with_config(
                     passed: false,
                     duration: Duration::ZERO,
                     failures: vec![format!("Failed to create sandbox: {e}")],
+                    failed_step: None,
                     fs_diff: None,
                 }],
             };
@@ -228,6 +241,7 @@ fn run_spec_with_config(
                 passed: false,
                 duration: Duration::ZERO,
                 failures: vec![format!("Setup failed: {e}")],
+                failed_step: None,
                 fs_diff: None,
             }],
         };
@@ -295,6 +309,7 @@ fn run_spec_with_config(
             passed: false,
             duration: Duration::ZERO,
             failures: vec![format!("Teardown failed: {e}")],
+            failed_step: None,
             fs_diff: None,
         });
     }
@@ -310,6 +325,7 @@ fn run_test(
 ) -> TestResult {
     let start = Instant::now();
     let mut failures = Vec::new();
+    let mut failed_step: Option<StepFailure> = None;
 
     // Determine if we should capture fs diff (test overrides file)
     let capture_fs_diff = test.capture_fs_diff.unwrap_or(file_capture_fs_diff);
@@ -321,30 +337,97 @@ fn run_test(
             passed: false,
             duration: start.elapsed(),
             failures: vec![format!("Test setup failed: {e}")],
+            failed_step: None,
             fs_diff: None,
         };
     }
 
-    // Capture filesystem state before command (if enabled)
+    // Capture filesystem state before steps (if enabled)
     let snapshot_before = if capture_fs_diff {
         Some(snapshot_filesystem(&ctx.sandbox_dir))
     } else {
         None
     };
 
-    // Run the command - test timeout overrides file timeout overrides default
+    // Determine timeout - test timeout overrides file timeout overrides default
     let timeout_secs = test
         .timeout
         .or(file_timeout)
         .unwrap_or(DEFAULT_TIMEOUT_SECS);
     let timeout = Duration::from_secs(timeout_secs);
-    match run_command(&test.run, ctx, timeout) {
-        Ok(output) => {
-            // Check assertions
-            check_expectations(&test.expect, &output, ctx, &mut failures);
+
+    // Execute steps sequentially
+    let is_multi_step = test.steps.len() > 1 || test.steps.first().is_some_and(|s| s.name != "run");
+
+    for (step_index, step) in test.steps.iter().enumerate() {
+        // Step-level setup
+        if let Err(e) = run_setup_steps(&step.setup, ctx) {
+            let msg = if is_multi_step {
+                format!("Step '{}' [{}] setup failed: {e}", step.name, step_index)
+            } else {
+                format!("Setup failed: {e}")
+            };
+            failures.push(msg);
+            failed_step = Some(StepFailure {
+                name: step.name.clone(),
+                index: step_index,
+            });
+            break; // Skip remaining steps
         }
-        Err(e) => {
-            failures.push(format!("Command execution failed: {e}"));
+
+        // Run the step command
+        let step_failed = match run_command(&step.run, ctx, timeout) {
+            Ok(output) => {
+                // Check step assertions
+                let mut step_failures = Vec::new();
+                check_expectations(&step.expect, &output, ctx, &mut step_failures);
+
+                if !step_failures.is_empty() {
+                    // Prefix failures with step info for multi-step tests
+                    for f in step_failures {
+                        let msg = if is_multi_step {
+                            format!("Step '{}' [{}]: {f}", step.name, step_index)
+                        } else {
+                            f
+                        };
+                        failures.push(msg);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(e) => {
+                let msg = if is_multi_step {
+                    format!(
+                        "Step '{}' [{}] execution failed: {e}",
+                        step.name, step_index
+                    )
+                } else {
+                    format!("Command execution failed: {e}")
+                };
+                failures.push(msg);
+                true
+            }
+        };
+
+        // Step-level teardown (always runs for this step, even if assertions failed)
+        if let Err(e) = run_teardown_steps(&step.teardown, ctx) {
+            let msg = if is_multi_step {
+                format!("Step '{}' [{}] teardown failed: {e}", step.name, step_index)
+            } else {
+                format!("Teardown failed: {e}")
+            };
+            failures.push(msg);
+        }
+
+        // If step failed, record it and skip remaining steps
+        if step_failed {
+            failed_step = Some(StepFailure {
+                name: step.name.clone(),
+                index: step_index,
+            });
+            break;
         }
     }
 
@@ -359,11 +442,15 @@ fn run_test(
         failures.push(format!("Test teardown failed: {e}"));
     }
 
+    // For single-step tests (implicit "run" step), don't report failed_step
+    let failed_step = if is_multi_step { failed_step } else { None };
+
     TestResult {
         name: test.name.clone(),
         passed: failures.is_empty(),
         duration: start.elapsed(),
         failures,
+        failed_step,
         fs_diff,
     }
 }
@@ -943,7 +1030,7 @@ fn run_simple_command(run: &RunStep, ctx: &ExecutionContext) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{CopyFile, WriteFile};
+    use crate::schema::{CopyFile, Step, WriteFile};
 
     /// Helper to create a minimal test spec with one test.
     fn make_spec(test: Test) -> TestSpec {
@@ -969,19 +1056,39 @@ mod tests {
             name: name.to_string(),
             description: None,
             setup: vec![],
-            run: Run {
-                cmd: cmd.to_string(),
-                args: args.into_iter().map(String::from).collect(),
-                stdin: None,
-                env: HashMap::new(),
-                cwd: None,
-                shell: false,
-            },
-            expect: Expect::default(),
+            steps: vec![Step {
+                name: "run".to_string(),
+                setup: vec![],
+                run: Run {
+                    cmd: cmd.to_string(),
+                    args: args.into_iter().map(String::from).collect(),
+                    stdin: None,
+                    env: HashMap::new(),
+                    cwd: None,
+                    shell: false,
+                },
+                expect: Expect::default(),
+                teardown: vec![],
+            }],
             teardown: vec![],
             timeout: None,
             serial: false,
             capture_fs_diff: None,
+        }
+    }
+
+    /// Helper trait to access the first step's run/expect for test compatibility.
+    trait TestExt {
+        fn run_mut(&mut self) -> &mut Run;
+        fn expect_mut(&mut self) -> &mut Expect;
+    }
+
+    impl TestExt for Test {
+        fn run_mut(&mut self) -> &mut Run {
+            &mut self.steps[0].run
+        }
+        fn expect_mut(&mut self) -> &mut Expect {
+            &mut self.steps[0].expect
         }
     }
 
@@ -1005,7 +1112,7 @@ mod tests {
     #[test]
     fn test_exit_code_zero() {
         let mut test = make_test("exit_zero", "true", vec![]);
-        test.expect.exit = Some(0);
+        test.expect_mut().exit = Some(0);
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
 
@@ -1019,7 +1126,7 @@ mod tests {
     #[test]
     fn test_exit_code_nonzero() {
         let mut test = make_test("exit_one", "false", vec![]);
-        test.expect.exit = Some(1);
+        test.expect_mut().exit = Some(1);
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
 
@@ -1033,7 +1140,7 @@ mod tests {
     #[test]
     fn test_exit_code_mismatch() {
         let mut test = make_test("exit_mismatch", "true", vec![]);
-        test.expect.exit = Some(1); // Expecting 1 but will get 0
+        test.expect_mut().exit = Some(1); // Expecting 1 but will get 0
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
 
@@ -1046,7 +1153,7 @@ mod tests {
     #[test]
     fn test_stdout_exact_match() {
         let mut test = make_test("stdout_exact", "echo", vec!["hello"]);
-        test.expect.stdout = Some(OutputMatch::Exact("hello\n".to_string()));
+        test.expect_mut().stdout = Some(OutputMatch::Exact("hello\n".to_string()));
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
 
@@ -1060,7 +1167,7 @@ mod tests {
     #[test]
     fn test_stdout_exact_mismatch() {
         let mut test = make_test("stdout_exact_fail", "echo", vec!["hello"]);
-        test.expect.stdout = Some(OutputMatch::Exact("world\n".to_string()));
+        test.expect_mut().stdout = Some(OutputMatch::Exact("world\n".to_string()));
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
 
@@ -1071,7 +1178,7 @@ mod tests {
     #[test]
     fn test_stdout_contains() {
         let mut test = make_test("stdout_contains", "echo", vec!["hello world"]);
-        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+        test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
             equals: None,
             contains: Some("world".to_string()),
             regex: None,
@@ -1089,7 +1196,7 @@ mod tests {
     #[test]
     fn test_stdout_contains_mismatch() {
         let mut test = make_test("stdout_contains_fail", "echo", vec!["hello"]);
-        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+        test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
             equals: None,
             contains: Some("world".to_string()),
             regex: None,
@@ -1104,7 +1211,7 @@ mod tests {
     #[test]
     fn test_stdout_regex() {
         let mut test = make_test("stdout_regex", "echo", vec!["hello123world"]);
-        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+        test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
             equals: None,
             contains: None,
             regex: Some(r"hello\d+world".to_string()),
@@ -1122,7 +1229,7 @@ mod tests {
     #[test]
     fn test_stdout_regex_mismatch() {
         let mut test = make_test("stdout_regex_fail", "echo", vec!["hello"]);
-        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+        test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
             equals: None,
             contains: None,
             regex: Some(r"\d+".to_string()),
@@ -1137,7 +1244,7 @@ mod tests {
     #[test]
     fn test_stdout_invalid_regex() {
         let mut test = make_test("stdout_invalid_regex", "echo", vec!["hello"]);
-        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+        test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
             equals: None,
             contains: None,
             regex: Some(r"[invalid".to_string()),
@@ -1154,7 +1261,7 @@ mod tests {
     #[test]
     fn test_stderr_contains() {
         let mut test = make_test("stderr_test", "sh", vec!["-c", "echo error >&2"]);
-        test.expect.stderr = Some(OutputMatch::Structured(OutputMatchStructured {
+        test.expect_mut().stderr = Some(OutputMatch::Structured(OutputMatchStructured {
             equals: None,
             contains: Some("error".to_string()),
             regex: None,
@@ -1174,7 +1281,7 @@ mod tests {
     #[test]
     fn test_file_exists() {
         let mut test = make_test("file_exists", "touch", vec!["output.txt"]);
-        test.expect.files = vec![FileExpect {
+        test.expect_mut().files = vec![FileExpect {
             path: PathBuf::from("output.txt"),
             exists: Some(true),
             contents: None,
@@ -1192,7 +1299,7 @@ mod tests {
     #[test]
     fn test_file_not_exists() {
         let mut test = make_test("file_not_exists", "true", vec![]);
-        test.expect.files = vec![FileExpect {
+        test.expect_mut().files = vec![FileExpect {
             path: PathBuf::from("nonexistent.txt"),
             exists: Some(false),
             contents: None,
@@ -1210,7 +1317,7 @@ mod tests {
     #[test]
     fn test_file_exists_failure() {
         let mut test = make_test("file_exists_fail", "true", vec![]);
-        test.expect.files = vec![FileExpect {
+        test.expect_mut().files = vec![FileExpect {
             path: PathBuf::from("missing.txt"),
             exists: Some(true),
             contents: None,
@@ -1225,7 +1332,7 @@ mod tests {
     #[test]
     fn test_file_contents() {
         let mut test = make_test("file_contents", "sh", vec!["-c", "echo hello > output.txt"]);
-        test.expect.files = vec![FileExpect {
+        test.expect_mut().files = vec![FileExpect {
             path: PathBuf::from("output.txt"),
             exists: None,
             contents: Some(OutputMatch::Exact("hello\n".to_string())),
@@ -1247,7 +1354,7 @@ mod tests {
             "sh",
             vec!["-c", "echo 'hello world' > output.txt"],
         );
-        test.expect.files = vec![FileExpect {
+        test.expect_mut().files = vec![FileExpect {
             path: PathBuf::from("output.txt"),
             exists: None,
             contents: Some(OutputMatch::Structured(OutputMatchStructured {
@@ -1271,7 +1378,7 @@ mod tests {
     #[test]
     fn test_file_level_setup_write_file() {
         let mut test = make_test("read_setup_file", "cat", vec!["config.txt"]);
-        test.expect.stdout = Some(OutputMatch::Exact("test config\n".to_string()));
+        test.expect_mut().stdout = Some(OutputMatch::Exact("test config\n".to_string()));
         let mut spec = make_spec(test);
         spec.setup = vec![SetupStep {
             write_file: Some(WriteFile {
@@ -1294,7 +1401,7 @@ mod tests {
     #[test]
     fn test_file_level_setup_create_dir() {
         let mut test = make_test("check_dir", "test", vec!["-d", "subdir"]);
-        test.expect.exit = Some(0);
+        test.expect_mut().exit = Some(0);
         let mut spec = make_spec(test);
         spec.setup = vec![SetupStep {
             write_file: None,
@@ -1314,7 +1421,7 @@ mod tests {
     #[test]
     fn test_test_level_setup() {
         let mut test = make_test("read_test_setup_file", "cat", vec!["test_config.txt"]);
-        test.expect.stdout = Some(OutputMatch::Exact("per-test config\n".to_string()));
+        test.expect_mut().stdout = Some(OutputMatch::Exact("per-test config\n".to_string()));
         test.setup = vec![SetupStep {
             write_file: Some(WriteFile {
                 path: PathBuf::from("test_config.txt"),
@@ -1337,7 +1444,7 @@ mod tests {
     #[test]
     fn test_setup_copy_file() {
         let mut test = make_test("read_copied_file", "cat", vec!["dest.txt"]);
-        test.expect.stdout = Some(OutputMatch::Exact("original content\n".to_string()));
+        test.expect_mut().stdout = Some(OutputMatch::Exact("original content\n".to_string()));
         let mut spec = make_spec(test);
         spec.setup = vec![
             SetupStep {
@@ -1371,7 +1478,7 @@ mod tests {
     #[test]
     fn test_setup_run_command() {
         let mut test = make_test("check_setup_command", "cat", vec!["created_by_setup.txt"]);
-        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+        test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
             equals: None,
             contains: Some("setup ran".to_string()),
             regex: None,
@@ -1401,7 +1508,7 @@ mod tests {
     #[test]
     fn test_teardown_removes_file() {
         let mut test = make_test("create_file", "touch", vec!["to_remove.txt"]);
-        test.expect.files = vec![FileExpect {
+        test.expect_mut().files = vec![FileExpect {
             path: PathBuf::from("to_remove.txt"),
             exists: Some(true),
             contents: None,
@@ -1434,7 +1541,7 @@ mod tests {
     #[test]
     fn test_sandbox_env() {
         let mut test = make_test("env_test", "sh", vec!["-c", "echo $MY_VAR"]);
-        test.expect.stdout = Some(OutputMatch::Exact("test_value\n".to_string()));
+        test.expect_mut().stdout = Some(OutputMatch::Exact("test_value\n".to_string()));
         let mut spec = make_spec(test);
         spec.sandbox
             .env
@@ -1451,8 +1558,8 @@ mod tests {
     #[test]
     fn test_command_env_override() {
         let mut test = make_test("env_override", "sh", vec!["-c", "echo $MY_VAR"]);
-        test.expect.stdout = Some(OutputMatch::Exact("overridden\n".to_string()));
-        test.run
+        test.expect_mut().stdout = Some(OutputMatch::Exact("overridden\n".to_string()));
+        test.run_mut()
             .env
             .insert("MY_VAR".to_string(), "overridden".to_string());
         let mut spec = make_spec(test);
@@ -1477,7 +1584,7 @@ mod tests {
             "sh",
             vec!["-c", "echo ${BINTEST_CUSTOM_VAR:-empty}"],
         );
-        test.expect.stdout = Some(OutputMatch::Exact("empty\n".to_string()));
+        test.expect_mut().stdout = Some(OutputMatch::Exact("empty\n".to_string()));
         let spec = make_spec(test);
         // Even if BINTEST_CUSTOM_VAR is set in the host, it shouldn't be inherited
         let result = run_spec_standalone(&spec);
@@ -1494,8 +1601,8 @@ mod tests {
     #[test]
     fn test_stdin() {
         let mut test = make_test("stdin_test", "cat", vec![]);
-        test.run.stdin = Some("input data".to_string());
-        test.expect.stdout = Some(OutputMatch::Exact("input data".to_string()));
+        test.run_mut().stdin = Some("input data".to_string());
+        test.expect_mut().stdout = Some(OutputMatch::Exact("input data".to_string()));
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
 
@@ -1511,8 +1618,8 @@ mod tests {
     #[test]
     fn test_shell_mode() {
         let mut test = make_test("shell_test", "echo", vec!["hello", "&&", "echo", "world"]);
-        test.run.shell = true;
-        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+        test.run_mut().shell = true;
+        test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
             equals: None,
             contains: Some("hello".to_string()),
             regex: None,
@@ -1551,7 +1658,7 @@ mod tests {
             "sh",
             vec!["-c", "kill -9 $$"], // $$ is the shell's PID
         );
-        test.expect.signal = Some(9); // SIGKILL
+        test.expect_mut().signal = Some(9); // SIGKILL
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
 
@@ -1567,7 +1674,7 @@ mod tests {
     fn test_signal_assertion_wrong_signal() {
         // Test expects SIGTERM (15) but gets SIGKILL (9)
         let mut test = make_test("signal_mismatch", "sh", vec!["-c", "kill -9 $$"]);
-        test.expect.signal = Some(15); // SIGTERM
+        test.expect_mut().signal = Some(15); // SIGTERM
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
 
@@ -1580,7 +1687,7 @@ mod tests {
     fn test_signal_expected_but_normal_exit() {
         // Test expects a signal but process exits normally
         let mut test = make_test("signal_expected_normal_exit", "true", vec![]);
-        test.expect.signal = Some(9);
+        test.expect_mut().signal = Some(9);
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
 
@@ -1593,7 +1700,7 @@ mod tests {
     fn test_exit_expected_but_signal_received() {
         // Test expects exit code 0 but gets killed by signal
         let mut test = make_test("exit_expected_signal", "sh", vec!["-c", "kill -9 $$"]);
-        test.expect.exit = Some(0);
+        test.expect_mut().exit = Some(0);
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
 
@@ -1630,10 +1737,10 @@ mod tests {
         // First test creates a file, second test reads it
         // Both must be serial since test2 depends on test1's output
         let mut test1 = make_test("create_file", "sh", vec!["-c", "echo shared > shared.txt"]);
-        test1.expect.exit = Some(0);
+        test1.expect_mut().exit = Some(0);
         test1.serial = true;
         let mut test2 = make_test("read_file", "cat", vec!["shared.txt"]);
-        test2.expect.stdout = Some(OutputMatch::Exact("shared\n".to_string()));
+        test2.expect_mut().stdout = Some(OutputMatch::Exact("shared\n".to_string()));
         test2.serial = true;
         let spec = TestSpec {
             version: 1,
@@ -1663,12 +1770,12 @@ mod tests {
     #[test]
     fn test_custom_cwd() {
         let mut test = make_test("cwd_test", "pwd", vec![]);
-        test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+        test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
             equals: None,
             contains: Some("subdir".to_string()),
             regex: None,
         }));
-        test.run.cwd = Some(PathBuf::from("subdir"));
+        test.run_mut().cwd = Some(PathBuf::from("subdir"));
         let mut spec = make_spec(test);
         spec.setup = vec![SetupStep {
             write_file: None,
@@ -1741,7 +1848,7 @@ mod tests {
         };
 
         let mut test = make_test("env_test", "sh", vec!["-c", "echo $SUITE_VAR"]);
-        test.expect.stdout = Some(OutputMatch::Exact("from_suite\n".to_string()));
+        test.expect_mut().stdout = Some(OutputMatch::Exact("from_suite\n".to_string()));
         let spec = make_spec(test);
         let result = run_spec(&spec, Some(&suite_config));
 
@@ -1771,7 +1878,7 @@ mod tests {
         };
 
         let mut test = make_test("env_override", "sh", vec!["-c", "echo $MY_VAR"]);
-        test.expect.stdout = Some(OutputMatch::Exact("from_file\n".to_string()));
+        test.expect_mut().stdout = Some(OutputMatch::Exact("from_file\n".to_string()));
         let mut spec = make_spec(test);
         spec.sandbox
             .env
@@ -1904,7 +2011,7 @@ mod tests {
 
         let mut parallel_test = make_test("parallel_read", "cat", vec!["marker.txt"]);
         parallel_test.serial = false;
-        parallel_test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+        parallel_test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
             equals: None,
             contains: Some("created".to_string()),
             regex: None,
@@ -2113,7 +2220,7 @@ mod tests {
             "sh",
             vec!["-c", "mkdir -p src && touch src/main.rs Cargo.toml"],
         );
-        test.expect.tree = Some(TreeExpect {
+        test.expect_mut().tree = Some(TreeExpect {
             root: None,
             contains: vec![
                 TreeEntry {
@@ -2143,7 +2250,7 @@ mod tests {
         use crate::schema::{TreeEntry, TreeExpect};
 
         let mut test = make_test("empty_tree", "true", vec![]);
-        test.expect.tree = Some(TreeExpect {
+        test.expect_mut().tree = Some(TreeExpect {
             root: None,
             contains: vec![TreeEntry {
                 path: PathBuf::from("missing.txt"),
@@ -2169,7 +2276,7 @@ mod tests {
         use crate::schema::TreeExpect;
 
         let mut test = make_test("no_target", "true", vec![]);
-        test.expect.tree = Some(TreeExpect {
+        test.expect_mut().tree = Some(TreeExpect {
             root: None,
             contains: vec![],
             excludes: vec![PathBuf::from("target/")],
@@ -2190,7 +2297,7 @@ mod tests {
         use crate::schema::TreeExpect;
 
         let mut test = make_test("creates_forbidden", "mkdir", vec!["forbidden"]);
-        test.expect.tree = Some(TreeExpect {
+        test.expect_mut().tree = Some(TreeExpect {
             root: None,
             contains: vec![],
             excludes: vec![PathBuf::from("forbidden")],
@@ -2217,7 +2324,7 @@ mod tests {
             "sh",
             vec!["-c", "echo 'hello world' > greeting.txt"],
         );
-        test.expect.tree = Some(TreeExpect {
+        test.expect_mut().tree = Some(TreeExpect {
             root: None,
             contains: vec![TreeEntry {
                 path: PathBuf::from("greeting.txt"),
@@ -2262,7 +2369,7 @@ mod tests {
 
         // Run a simple test
         let mut test = make_test("sandbox_test", "sh", vec!["-c", "pwd"]);
-        test.expect.exit = Some(0);
+        test.expect_mut().exit = Some(0);
         let spec = make_spec(test);
 
         let result = run_spec(&spec, Some(&suite_config));

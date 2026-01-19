@@ -16,6 +16,8 @@ pub enum LoadError {
     Toml(toml::de::Error),
     /// Unsupported file extension.
     UnsupportedFormat(String),
+    /// Spec validation failed.
+    Validation(String),
 }
 
 impl std::fmt::Display for LoadError {
@@ -30,6 +32,7 @@ impl std::fmt::Display for LoadError {
                     "unsupported file format: {ext} (expected .yaml, .yml, or .toml)"
                 )
             }
+            LoadError::Validation(msg) => write!(f, "validation error: {msg}"),
         }
     }
 }
@@ -44,11 +47,35 @@ pub fn load_spec(path: &Path) -> Result<TestSpec, LoadError> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let contents = std::fs::read_to_string(path).map_err(LoadError::Io)?;
 
-    match ext {
-        "yaml" | "yml" => serde_yaml::from_str(&contents).map_err(LoadError::Yaml),
-        "toml" => toml::from_str(&contents).map_err(LoadError::Toml),
-        other => Err(LoadError::UnsupportedFormat(other.to_string())),
+    let spec: TestSpec = match ext {
+        "yaml" | "yml" => serde_yaml::from_str(&contents).map_err(LoadError::Yaml)?,
+        "toml" => toml::from_str(&contents).map_err(LoadError::Toml)?,
+        other => return Err(LoadError::UnsupportedFormat(other.to_string())),
+    };
+
+    validate_spec(&spec)?;
+    Ok(spec)
+}
+
+/// Validate a test spec for semantic correctness.
+fn validate_spec(spec: &TestSpec) -> Result<(), LoadError> {
+    for test in &spec.tests {
+        if test.steps.is_empty() {
+            return Err(LoadError::Validation(format!(
+                "test '{}' has no steps",
+                test.name
+            )));
+        }
+        for (i, step) in test.steps.iter().enumerate() {
+            if step.name.is_empty() {
+                return Err(LoadError::Validation(format!(
+                    "test '{}' step {} has no name",
+                    test.name, i
+                )));
+            }
+        }
     }
+    Ok(())
 }
 
 /// Load suite configuration from a directory.

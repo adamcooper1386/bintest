@@ -39,22 +39,51 @@ This leads to:
 - Language-specific assertions
 - Property-based testing
 - Performance benchmarking
+- ORM-style assertions (use raw SQL)
+- Schema diffing or database migrations
+- Non-SQL databases (NoSQL, key-value stores)
 
-This is **not** a test framework.  
-It is a **binary execution spec runner**.
+This is **not** a test framework.
+It is a **binary execution spec runner** that verifies all observable effects of running a binary, including external state like databases.
 
 ## Core Concept
 
 Tests are defined as **declarative execution specs**.
 
 Each spec:
-- describes setup steps
+- describes setup steps (filesystem, database state)
 - defines one or more executable invocations
-- asserts on outputs, exit codes, and filesystem effects
+- asserts on outputs, exit codes, filesystem effects, and database state
 - defines teardown explicitly
 - runs sequentially and deterministically
 
 No Rust code is required to write tests.
+
+### Multi-Step Tests
+
+Many real-world workflows require running multiple commands with state verification between each step. bintest supports multi-step tests where each step can have its own assertions:
+
+```yaml
+tests:
+  - name: migration_rollback_workflow
+    steps:
+      - name: apply_migrations
+        run:
+          cmd: sqler
+          args: ["migrate"]
+        expect:
+          exit: 0
+          sql:
+            - table_exists: users
+      - name: rollback
+        run:
+          cmd: sqler
+          args: ["migrate", "down"]
+        expect:
+          exit: 0
+          sql:
+            - table_not_exists: users
+```
 
 ## User Experience
 
@@ -106,7 +135,7 @@ Three levels of configuration:
 ## Functional Requirements
 
 ### Test Definition
-- Define environment variables
+- Define environment variables (with interpolation support)
 - Define working directory
 - Define temp directories
 - Define file fixtures
@@ -116,6 +145,84 @@ Three levels of configuration:
   - exit code
   - stdout / stderr (exact, contains, regex)
   - filesystem state
+  - database state (SQL query results)
+
+### Database Connections
+
+Define database connections at suite, file, or test level:
+
+```yaml
+databases:
+  default:
+    driver: postgres
+    url: "${DATABASE_URL}"
+  root:
+    driver: postgres
+    url: "postgres://${ROOT_USER}:${ROOT_PASSWORD}@localhost:5432/postgres"
+```
+
+**Supported drivers:**
+- `postgres` - PostgreSQL
+- `sqlite` - SQLite (including `:memory:`)
+
+**Connection lifecycle:**
+- Lazy connections (opened on first use)
+- Pooled per-file (shared across tests in a file)
+- Closed after file teardown completes
+- Connection errors show clear messages with masked passwords
+
+### SQL Assertions
+
+Assert database state after command execution:
+
+```yaml
+expect:
+  sql:
+    # Raw query with exact match
+    - query: "SELECT COUNT(*) FROM users"
+      returns: "3"
+
+    # Query with contains/regex matching
+    - query: "SELECT name FROM users"
+      returns:
+        contains: "alice"
+
+    # Shorthand existence checks
+    - table_exists: users
+    - table_not_exists: temp_data
+
+    # Row count assertions
+    - row_count:
+        table: users
+        equals: 3
+
+    # Empty/null checks
+    - query: "SELECT * FROM deleted_users"
+      returns_empty: true
+```
+
+### SQL Setup/Teardown
+
+Execute SQL during setup and teardown:
+
+```yaml
+setup:
+  - sql:
+      database: root
+      statements:
+        - "DROP DATABASE IF EXISTS testdb"
+        - "CREATE DATABASE testdb"
+  - sql_file:
+      database: default
+      path: fixtures/schema.sql
+
+teardown:
+  - sql:
+      database: root
+      statements:
+        - "DROP DATABASE IF EXISTS testdb"
+      on_error: continue
+```
 
 ### Binary Resolution
 - Binaries are resolved via PATH or absolute path
@@ -127,9 +234,50 @@ Three levels of configuration:
 - Guaranteed teardown execution (even on failure)
 
 ### State Isolation
-- Each test runs in its own sandbox
+- Each test file runs in its own sandbox
+- Tests within a file share the sandbox (can affect each other)
 - No shared global state by default
 - No implicit filesystem access
+- Database state is NOT automatically isolated (use setup/teardown)
+
+### Multi-Step Tests
+
+Tests can contain multiple steps executed sequentially:
+
+```yaml
+tests:
+  - name: workflow_test
+    steps:
+      - name: step_one
+        run:
+          cmd: my_cli
+          args: ["init"]
+        expect:
+          exit: 0
+      - name: step_two
+        setup:
+          - write_file:
+              path: config.json
+              contents: "{}"
+        run:
+          cmd: my_cli
+          args: ["run"]
+        expect:
+          exit: 0
+          sql:
+            - row_count:
+                table: results
+                greater_than: 0
+```
+
+**Step execution semantics:**
+- Steps execute sequentially within a test
+- If any step fails, subsequent steps are skipped
+- Each step can have its own setup and teardown
+- Step-level setup runs after test-level setup
+- Failure reporting shows which step failed
+
+**Backward compatibility:** Single `run`/`expect` tests work as before (implicit single step).
 
 ### Observability
 - Capture stdout, stderr
@@ -144,46 +292,107 @@ Three levels of configuration:
 
 ## Example Test (Illustrative)
 
+### Basic CLI Test
+
 ```yaml
 version: 1
 
 sandbox:
-workdir: temp
+  workdir: temp
 env:
   RUST_LOG: debug
 
 setup:
-- write_file:
-    path: config.toml
-    contents: |
-      mode = "test"
+  - write_file:
+      path: config.toml
+      contents: |
+        mode = "test"
 
 tests:
-- name: init_creates_state
-  run:
-    cmd: my_binary
-    args: ["init"]
-  expect:
-    exit: 0
-    stdout:
-      contains: "initialized"
-    files:
-      - path: state.json
-        exists: true
+  - name: init_creates_state
+    run:
+      cmd: my_binary
+      args: ["init"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "initialized"
+      files:
+        - path: state.json
+          exists: true
 
 teardown:
-- remove_dir: sandbox
+  - remove_dir: sandbox
+```
 
-Success Metrics
+### Database CLI Test (Multi-Step)
 
-AI agent can generate a valid test without human correction
+```yaml
+version: 1
 
-No Rust knowledge required to author tests
+databases:
+  default:
+    driver: postgres
+    url: "${DATABASE_URL}"
+  root:
+    driver: postgres
+    url: "${ROOT_DATABASE_URL}"
 
-Zero test harness code in user repos
+setup:
+  - sql:
+      database: root
+      statements:
+        - "DROP DATABASE IF EXISTS test_db"
+        - "CREATE DATABASE test_db"
+      on_error: continue
+  - copy_dir:
+      from: fixtures/migrations
+      to: sql/migrations
 
-Tests are readable without context
+teardown:
+  - sql:
+      database: root
+      statements:
+        - "DROP DATABASE IF EXISTS test_db"
+      on_error: continue
 
-Failures are self-explanatory
+tests:
+  - name: migration_rollback_workflow
+    steps:
+      - name: apply_all_migrations
+        run:
+          cmd: sqler
+          args: ["migrate"]
+        expect:
+          exit: 0
+          sql:
+            - table_exists: users
+            - table_exists: posts
+            - row_count:
+                table: _migrations
+                equals: 2
+
+      - name: rollback_one
+        run:
+          cmd: sqler
+          args: ["migrate", "down"]
+        expect:
+          exit: 0
+          sql:
+            - table_exists: users
+            - table_not_exists: posts
+            - row_count:
+                table: _migrations
+                equals: 1
+```
+
+## Success Metrics
+
+- AI agent can generate a valid test without human correction
+- No Rust knowledge required to author tests
+- Zero test harness code in user repos
+- Tests are readable without context
+- Failures are self-explanatory
+- Database state assertions replace shell script helper functions
 
 

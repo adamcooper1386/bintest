@@ -216,6 +216,7 @@ fn main() {
                                     passed: false,
                                     duration: Duration::ZERO,
                                     failures: vec![format!("Failed to load spec: {e}")],
+                                    failed_step: None,
                                     fs_diff: None,
                                 }],
                                 total_time: Duration::ZERO,

@@ -1,0 +1,95 @@
+# Multi-step tests - demonstrates the steps feature
+#
+# Tests can contain multiple steps that run sequentially.
+# Each step can have its own setup, run, expect, and teardown.
+# If any step fails, subsequent steps are skipped.
+
+version: 1
+
+tests:
+  # Simple two-step workflow
+  - name: create_and_verify
+    steps:
+      - name: create_file
+        run:
+          cmd: sh
+          args: ["-c", "echo 'step one' > output.txt"]
+        expect:
+          exit: 0
+
+      - name: verify_file
+        run:
+          cmd: cat
+          args: ["output.txt"]
+        expect:
+          exit: 0
+          stdout: "step one\n"
+
+  # Steps with their own setup
+  - name: steps_with_setup
+    setup:
+      - write_file:
+          path: initial.txt
+          contents: "test-level setup"
+    steps:
+      - name: first_step
+        run:
+          cmd: cat
+          args: ["initial.txt"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "test-level"
+
+      - name: second_step
+        setup:
+          - write_file:
+              path: step_file.txt
+              contents: "step-level setup"
+        run:
+          cmd: cat
+          args: ["step_file.txt"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "step-level"
+
+  # Simulating a build workflow
+  - name: build_workflow
+    steps:
+      - name: init
+        run:
+          cmd: sh
+          args: ["-c", "mkdir -p build && echo 'initialized' > build/status"]
+        expect:
+          exit: 0
+
+      - name: compile
+        run:
+          cmd: sh
+          args: ["-c", "echo 'compiled' >> build/status"]
+        expect:
+          exit: 0
+          files:
+            - path: build/status
+              exists: true
+
+      - name: verify
+        run:
+          cmd: cat
+          args: ["build/status"]
+        expect:
+          exit: 0
+          stdout: |
+            initialized
+            compiled
+
+  # Mixed single-step and multi-step in same file
+  - name: simple_single_step
+    run:
+      cmd: echo
+      args: ["single step still works"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "single step"
