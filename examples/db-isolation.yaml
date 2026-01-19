@@ -1,0 +1,123 @@
+version: 1
+
+# Database isolation example
+# This demonstrates how per_file isolation ensures each test starts with
+# a fresh database state, without needing explicit setup/teardown per test.
+#
+# With `isolation: per_file`, bintest:
+# 1. Runs file-level setup to create the initial database schema/data
+# 2. Captures a snapshot of this state
+# 3. Restores this snapshot before each test runs
+#
+# This means each test sees the exact same starting state, regardless of
+# what previous tests did to the database.
+
+databases:
+  default:
+    driver: sqlite
+    url: "sqlite::memory:"
+    # Enable per-file isolation - each test gets a fresh database state
+    isolation: per_file
+
+sandbox:
+  workdir: temp
+
+# File-level setup creates the baseline state that will be restored before each test
+setup:
+  - sql:
+      database: default
+      statements:
+        - "CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER)"
+        - "INSERT INTO counter (value) VALUES (0)"
+        - "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
+        - "INSERT INTO users (name) VALUES ('initial_user')"
+
+tests:
+  # Each test modifies the database, but the next test won't see those changes
+  # because isolation resets the state before each test.
+
+  - name: test_increment_counter
+    serial: true
+    description: Increment the counter - next test should still see 0
+    run:
+      # This command increments the counter
+      cmd: sh
+      args: ["-c", "echo 'Incrementing counter'"]
+    # First, verify we start at the expected state
+    expect:
+      exit: 0
+      sql:
+        - query: "SELECT value FROM counter"
+          returns: "0"
+    # After the test runs, we modify the database
+    # (In real usage, the binary under test would do this)
+    teardown:
+      - sql:
+          database: default
+          statements:
+            - "UPDATE counter SET value = value + 10"
+
+  - name: test_still_at_zero
+    serial: true
+    description: Counter should still be 0 due to isolation
+    run:
+      cmd: echo
+      args: ["Checking counter value"]
+    expect:
+      exit: 0
+      sql:
+        # Despite the previous test updating the counter to 10,
+        # isolation has reset us back to the post-setup state (0)
+        - query: "SELECT value FROM counter"
+          returns: "0"
+        # Users table should also be at its initial state
+        - query: "SELECT COUNT(*) FROM users"
+          returns: "1"
+        - query: "SELECT name FROM users"
+          returns: "initial_user"
+
+  - name: test_add_users
+    serial: true
+    description: Add users - next test should only see the initial user
+    run:
+      cmd: echo
+      args: ["Adding users"]
+    expect:
+      exit: 0
+      sql:
+        - query: "SELECT COUNT(*) FROM users"
+          returns: "1"
+    teardown:
+      - sql:
+          database: default
+          statements:
+            - "INSERT INTO users (name) VALUES ('alice')"
+            - "INSERT INTO users (name) VALUES ('bob')"
+            - "INSERT INTO users (name) VALUES ('charlie')"
+
+  - name: test_users_reset
+    serial: true
+    description: Should only see initial_user despite previous test adding users
+    run:
+      cmd: echo
+      args: ["Verifying user isolation"]
+    expect:
+      exit: 0
+      sql:
+        # The 3 users added by the previous test are gone
+        - query: "SELECT COUNT(*) FROM users"
+          returns: "1"
+        - query: "SELECT name FROM users"
+          returns: "initial_user"
+
+  # This test demonstrates that setup state IS preserved
+  - name: test_schema_preserved
+    description: Table structure from file setup is always available
+    run:
+      cmd: echo
+      args: ["Checking schema"]
+    expect:
+      exit: 0
+      sql:
+        - table_exists: counter
+        - table_exists: users

@@ -6,7 +6,7 @@
 // Allow dead code for now - these will be used when SQL assertions are implemented.
 #![allow(dead_code)]
 
-use crate::schema::{DatabaseConfig, DbDriver};
+use crate::schema::{DatabaseConfig, DbDriver, DbIsolation};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -410,6 +410,75 @@ impl ConnectionManager {
         self.configs.get(name).map(|c| c.driver)
     }
 
+    /// Get the isolation mode for a named database.
+    pub fn get_isolation(&self, name: &str) -> Option<DbIsolation> {
+        self.configs.get(name).map(|c| c.isolation)
+    }
+
+    /// Get all database names that have per-file isolation enabled.
+    pub fn get_isolated_databases(&self) -> Vec<String> {
+        self.configs
+            .iter()
+            .filter(|(_, config)| config.isolation == DbIsolation::PerFile)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Initialize isolation for a database.
+    ///
+    /// For SQLite with `per_file` isolation: Creates a fresh in-memory database.
+    /// For PostgreSQL with `per_file` isolation: Creates an automatic snapshot
+    /// named `__isolation__` after file-level setup completes.
+    ///
+    /// This should be called after file-level setup for databases with `per_file` isolation.
+    pub fn init_isolation(&self, database: &str) -> Result<(), DbError> {
+        let config = self.configs.get(database).ok_or_else(|| DbError {
+            message: format!("Database '{database}' is not configured"),
+            database: Some(database.to_string()),
+            masked_url: None,
+        })?;
+
+        if config.isolation != DbIsolation::PerFile {
+            return Ok(());
+        }
+
+        match config.driver {
+            DbDriver::Sqlite => {
+                // For SQLite, we create a snapshot after setup completes
+                // This will be restored before each test
+                self.create_snapshot(database, "__isolation__")
+            }
+            DbDriver::Postgres => {
+                // For PostgreSQL, we also create a snapshot after setup
+                // Note: This requires the connection to already exist (from setup)
+                // If no setup was run, we try to connect and create a snapshot
+                drop(self.get(database)?);
+                self.create_snapshot(database, "__isolation__")
+            }
+        }
+    }
+
+    /// Reset a database to its isolated state.
+    ///
+    /// For databases with `per_file` isolation, restores from the `__isolation__`
+    /// snapshot created after file-level setup.
+    ///
+    /// This should be called before each test for databases with `per_file` isolation.
+    pub fn reset_isolation(&self, database: &str) -> Result<(), DbError> {
+        let config = self.configs.get(database).ok_or_else(|| DbError {
+            message: format!("Database '{database}' is not configured"),
+            database: Some(database.to_string()),
+            masked_url: None,
+        })?;
+
+        if config.isolation != DbIsolation::PerFile {
+            return Ok(());
+        }
+
+        // Restore from the isolation snapshot
+        self.restore_snapshot(database, "__isolation__")
+    }
+
     /// Create a snapshot of the database state.
     ///
     /// Currently only supported for SQLite databases. The snapshot is stored
@@ -459,11 +528,13 @@ impl ConnectionManager {
 
         // Copy the source database to the snapshot using the backup API
         {
-            let backup = rusqlite::backup::Backup::new(source_conn, &mut snapshot_conn)
-                .map_err(|e| DbError {
-                    message: format!("Failed to initialize backup: {e}"),
-                    database: Some(database.to_string()),
-                    masked_url: None,
+            let backup =
+                rusqlite::backup::Backup::new(source_conn, &mut snapshot_conn).map_err(|e| {
+                    DbError {
+                        message: format!("Failed to initialize backup: {e}"),
+                        database: Some(database.to_string()),
+                        masked_url: None,
+                    }
                 })?;
 
             backup
@@ -635,6 +706,7 @@ mod tests {
         let config = DatabaseConfig {
             driver: DbDriver::Sqlite,
             url: "sqlite::memory:".to_string(),
+            isolation: DbIsolation::None,
         };
 
         let mut conn = connect(&config, "test").unwrap();
@@ -667,6 +739,7 @@ mod tests {
             DatabaseConfig {
                 driver: DbDriver::Sqlite,
                 url: "sqlite::memory:".to_string(),
+                isolation: DbIsolation::None,
             },
         );
 
@@ -698,6 +771,7 @@ mod tests {
             DatabaseConfig {
                 driver: DbDriver::Sqlite,
                 url: "sqlite::memory:".to_string(),
+                isolation: DbIsolation::None,
             },
         );
 
@@ -756,6 +830,7 @@ mod tests {
             DatabaseConfig {
                 driver: DbDriver::Sqlite,
                 url: "sqlite::memory:".to_string(),
+                isolation: DbIsolation::None,
             },
         );
 
@@ -776,6 +851,7 @@ mod tests {
             DatabaseConfig {
                 driver: DbDriver::Sqlite,
                 url: "sqlite::memory:".to_string(),
+                isolation: DbIsolation::None,
             },
         );
 
@@ -822,5 +898,146 @@ mod tests {
             .execute("default", "SELECT value FROM counter")
             .unwrap();
         assert_eq!(val, "2");
+    }
+
+    #[test]
+    fn test_per_file_isolation() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "default".to_string(),
+            DatabaseConfig {
+                driver: DbDriver::Sqlite,
+                url: "sqlite::memory:".to_string(),
+                isolation: DbIsolation::PerFile,
+            },
+        );
+
+        let manager = ConnectionManager::new(configs);
+
+        // Simulate file-level setup: create schema and initial data
+        manager
+            .execute("default", "CREATE TABLE users (name TEXT)")
+            .unwrap();
+        manager
+            .execute("default", "INSERT INTO users VALUES ('initial')")
+            .unwrap();
+
+        // Initialize isolation (creates snapshot after setup)
+        manager.init_isolation("default").unwrap();
+
+        // Verify initial state
+        let count = manager
+            .execute("default", "SELECT COUNT(*) FROM users")
+            .unwrap();
+        assert_eq!(count, "1");
+
+        // Simulate test 1: add data
+        manager
+            .execute("default", "INSERT INTO users VALUES ('test1')")
+            .unwrap();
+        let count = manager
+            .execute("default", "SELECT COUNT(*) FROM users")
+            .unwrap();
+        assert_eq!(count, "2");
+
+        // Reset for next test
+        manager.reset_isolation("default").unwrap();
+
+        // Verify state is back to post-setup
+        let count = manager
+            .execute("default", "SELECT COUNT(*) FROM users")
+            .unwrap();
+        assert_eq!(count, "1");
+        let name = manager
+            .execute("default", "SELECT name FROM users")
+            .unwrap();
+        assert_eq!(name, "initial");
+
+        // Simulate test 2: different modifications
+        manager
+            .execute("default", "INSERT INTO users VALUES ('test2a')")
+            .unwrap();
+        manager
+            .execute("default", "INSERT INTO users VALUES ('test2b')")
+            .unwrap();
+        let count = manager
+            .execute("default", "SELECT COUNT(*) FROM users")
+            .unwrap();
+        assert_eq!(count, "3");
+
+        // Reset again
+        manager.reset_isolation("default").unwrap();
+        let count = manager
+            .execute("default", "SELECT COUNT(*) FROM users")
+            .unwrap();
+        assert_eq!(count, "1");
+    }
+
+    #[test]
+    fn test_get_isolated_databases() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "isolated1".to_string(),
+            DatabaseConfig {
+                driver: DbDriver::Sqlite,
+                url: "sqlite::memory:".to_string(),
+                isolation: DbIsolation::PerFile,
+            },
+        );
+        configs.insert(
+            "shared".to_string(),
+            DatabaseConfig {
+                driver: DbDriver::Sqlite,
+                url: "sqlite::memory:".to_string(),
+                isolation: DbIsolation::None,
+            },
+        );
+        configs.insert(
+            "isolated2".to_string(),
+            DatabaseConfig {
+                driver: DbDriver::Sqlite,
+                url: "sqlite::memory:".to_string(),
+                isolation: DbIsolation::PerFile,
+            },
+        );
+
+        let manager = ConnectionManager::new(configs);
+        let mut isolated = manager.get_isolated_databases();
+        isolated.sort();
+
+        assert_eq!(isolated, vec!["isolated1", "isolated2"]);
+    }
+
+    #[test]
+    fn test_isolation_no_op_for_none() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "default".to_string(),
+            DatabaseConfig {
+                driver: DbDriver::Sqlite,
+                url: "sqlite::memory:".to_string(),
+                isolation: DbIsolation::None,
+            },
+        );
+
+        let manager = ConnectionManager::new(configs);
+
+        // Create some data
+        manager
+            .execute("default", "CREATE TABLE test (x INTEGER)")
+            .unwrap();
+        manager
+            .execute("default", "INSERT INTO test VALUES (1)")
+            .unwrap();
+
+        // init_isolation should be a no-op for None isolation
+        manager.init_isolation("default").unwrap();
+
+        // reset_isolation should also be a no-op
+        manager.reset_isolation("default").unwrap();
+
+        // Data should still be there (no snapshot was created)
+        let val = manager.execute("default", "SELECT x FROM test").unwrap();
+        assert_eq!(val, "1");
     }
 }

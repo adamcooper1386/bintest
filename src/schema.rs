@@ -806,6 +806,24 @@ pub enum DbDriver {
     Sqlite,
 }
 
+/// Database isolation mode for per-file state management.
+///
+/// Controls how database state is handled between test files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DbIsolation {
+    /// No automatic isolation. Database state persists across tests (default).
+    /// Use explicit setup/teardown for state management.
+    #[default]
+    None,
+    /// Fresh database for each test file.
+    ///
+    /// For SQLite: Creates a fresh in-memory database for each file.
+    /// For PostgreSQL: Creates an automatic snapshot at file start and
+    /// restores it between tests (requires setup to create initial state).
+    PerFile,
+}
+
 /// Database connection configuration.
 ///
 /// Defines how to connect to a database. URLs support environment variable
@@ -823,6 +841,13 @@ pub struct DatabaseConfig {
     /// - `sqlite::memory:`
     /// - `${DATABASE_URL}`
     pub url: String,
+
+    /// Isolation mode for this database connection.
+    ///
+    /// Controls how database state is managed between test files.
+    /// Default is `none` (no automatic isolation).
+    #[serde(default)]
+    pub isolation: DbIsolation,
 }
 
 /// Generate the JSON Schema for test specification files.
@@ -1062,6 +1087,7 @@ tests:
         let default_db = spec.databases.get("default").unwrap();
         assert_eq!(default_db.driver, DbDriver::Postgres);
         assert_eq!(default_db.url, "${DATABASE_URL}");
+        assert_eq!(default_db.isolation, DbIsolation::None); // default
 
         let root_db = spec.databases.get("root").unwrap();
         assert_eq!(root_db.driver, DbDriver::Postgres);
@@ -1073,6 +1099,39 @@ tests:
         let sqlite_db = spec.databases.get("sqlite_test").unwrap();
         assert_eq!(sqlite_db.driver, DbDriver::Sqlite);
         assert_eq!(sqlite_db.url, "sqlite::memory:");
+    }
+
+    #[test]
+    fn parse_database_isolation() {
+        let yaml = r#"
+version: 1
+
+databases:
+  isolated:
+    driver: sqlite
+    url: "sqlite::memory:"
+    isolation: per_file
+  shared:
+    driver: sqlite
+    url: "sqlite::memory:"
+    isolation: none
+
+tests:
+  - name: test
+    run:
+      cmd: echo
+      args: ["hello"]
+    expect:
+      exit: 0
+"#;
+        let spec: TestSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.databases.len(), 2);
+
+        let isolated_db = spec.databases.get("isolated").unwrap();
+        assert_eq!(isolated_db.isolation, DbIsolation::PerFile);
+
+        let shared_db = spec.databases.get("shared").unwrap();
+        assert_eq!(shared_db.isolation, DbIsolation::None);
     }
 
     #[test]

@@ -360,6 +360,29 @@ fn run_spec_with_config(
         };
     }
 
+    // Initialize isolation for databases with per_file isolation
+    // This captures the post-setup state that will be restored before each test
+    let isolated_databases = db_manager.get_isolated_databases();
+    for db_name in &isolated_databases {
+        if let Err(e) = db_manager.init_isolation(db_name) {
+            return SpecResult {
+                tests: vec![TestResult {
+                    name: "<setup>".to_string(),
+                    passed: false,
+                    skipped: false,
+                    skip_reason: None,
+                    duration: Duration::ZERO,
+                    failures: vec![format!(
+                        "Failed to initialize database isolation for '{}': {}",
+                        db_name, e
+                    )],
+                    failed_step: None,
+                    fs_diff: None,
+                }],
+            };
+        }
+    }
+
     // Filter tests by name if a filter is provided
     let filtered_tests: Vec<(usize, &Test)> = spec
         .tests
@@ -462,6 +485,26 @@ fn run_test(
             };
         }
         ConditionResult::Run => {}
+    }
+
+    // Reset database isolation for databases with per_file isolation
+    // This restores the post-file-setup state before each test
+    for db_name in db_manager.get_isolated_databases() {
+        if let Err(e) = db_manager.reset_isolation(&db_name) {
+            return TestResult {
+                name: test.name.clone(),
+                passed: false,
+                skipped: false,
+                skip_reason: None,
+                duration: start.elapsed(),
+                failures: vec![format!(
+                    "Failed to reset database isolation for '{}': {}",
+                    db_name, e
+                )],
+                failed_step: None,
+                fs_diff: None,
+            };
+        }
     }
 
     // Determine if we should capture fs diff (test overrides file)
