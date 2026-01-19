@@ -412,11 +412,25 @@ sandbox:
     # Add environment variables here
     # RUST_LOG: debug
 
+# Database connections (optional)
+# databases:
+#   default:
+#     driver: sqlite
+#     url: "sqlite::memory:"
+#   # postgres:
+#   #   driver: postgres
+#   #   url: "${DATABASE_URL}"
+
 # setup:
 #   - write_file:
 #       path: config.toml
 #       contents: |
 #         key = "value"
+#   # SQL setup example:
+#   # - sql:
+#   #     database: default
+#   #     statements:
+#   #       - "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
 
 tests:
   - name: example_test
@@ -428,8 +442,25 @@ tests:
       stdout:
         contains: "hello"
 
+  # Database test example:
+  # - name: database_test
+  #   run:
+  #     cmd: echo
+  #     args: ["checking database"]
+  #   expect:
+  #     exit: 0
+  #     sql:
+  #       - table_exists: users
+  #       - query: "SELECT COUNT(*) FROM users"
+  #         returns: "0"
+
 # teardown:
 #   - remove_dir: sandbox
+#   # SQL teardown example:
+#   # - sql:
+#   #     database: default
+#   #     statements:
+#   #       - "DROP TABLE IF EXISTS users"
 "#;
             if path.exists() {
                 eprintln!("Error: file already exists: {}", path.display());
