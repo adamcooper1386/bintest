@@ -1,0 +1,38 @@
+# TOML format example
+# bintest supports both YAML and TOML spec files
+
+version = 1
+
+[sandbox]
+workdir = "temp"
+
+[[tests]]
+name = "echo_hello"
+[tests.run]
+cmd = "echo"
+args = ["hello", "world"]
+[tests.expect]
+exit = 0
+[tests.expect.stdout]
+contains = "hello"
+
+[[tests]]
+name = "echo_exact"
+[tests.run]
+cmd = "echo"
+args = ["test"]
+[tests.expect]
+exit = 0
+stdout = "test\n"
+
+[[tests]]
+name = "with_env"
+[tests.run]
+cmd = "sh"
+args = ["-c", "echo $MY_VAR"]
+[tests.run.env]
+MY_VAR = "from toml"
+[tests.expect]
+exit = 0
+[tests.expect.stdout]
+contains = "from toml"

@@ -1,0 +1,67 @@
+# Serial and parallel test execution
+# Control test execution order and concurrency
+
+version: 1
+
+sandbox:
+  workdir: temp
+
+tests:
+  # Serial tests run first, in declaration order
+  - name: serial_setup
+    description: This runs first (serial)
+    serial: true
+    run:
+      cmd: sh
+      args: ["-c", "echo 'setup' > state.txt"]
+    expect:
+      exit: 0
+
+  - name: serial_modify
+    description: This runs second (serial)
+    serial: true
+    run:
+      cmd: sh
+      args: ["-c", "echo 'modified' >> state.txt"]
+    expect:
+      exit: 0
+      files:
+        - path: state.txt
+          contents:
+            contains: "setup"
+
+  # Parallel tests run after all serial tests complete
+  # They run concurrently with no ordering guarantee
+  - name: parallel_one
+    description: Runs in parallel with parallel_two and parallel_three
+    run:
+      cmd: sleep
+      args: ["0.1"]
+    expect:
+      exit: 0
+
+  - name: parallel_two
+    description: Runs in parallel with parallel_one and parallel_three
+    run:
+      cmd: sleep
+      args: ["0.1"]
+    expect:
+      exit: 0
+
+  - name: parallel_three
+    description: Runs in parallel with parallel_one and parallel_two
+    run:
+      cmd: sleep
+      args: ["0.1"]
+    expect:
+      exit: 0
+
+  - name: parallel_verify_state
+    description: Can read state from serial tests
+    run:
+      cmd: cat
+      args: ["state.txt"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "modified"

@@ -1,0 +1,58 @@
+# Regex output matching
+# Use regular expressions to match stdout/stderr content
+
+version: 1
+
+sandbox:
+  workdir: temp
+
+tests:
+  - name: regex_version_format
+    description: Match a semantic version pattern
+    run:
+      cmd: echo
+      args: ["version 1.2.3"]
+    expect:
+      exit: 0
+      stdout:
+        regex: "version \\d+\\.\\d+\\.\\d+"
+
+  - name: regex_uuid
+    description: Match a UUID pattern
+    run:
+      cmd: sh
+      args: ["-c", "echo 'id: 550e8400-e29b-41d4-a716-446655440000'"]
+    expect:
+      exit: 0
+      stdout:
+        regex: "id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+  - name: regex_timestamp
+    description: Match ISO timestamp pattern
+    run:
+      cmd: date
+      args: ["+%Y-%m-%dT%H:%M:%S"]
+    expect:
+      exit: 0
+      stdout:
+        regex: "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}"
+
+  - name: regex_multiline
+    description: Match pattern across output (use (?s) for dotall mode)
+    run:
+      cmd: sh
+      args: ["-c", "echo 'START'; echo 'data here'; echo 'END'"]
+    expect:
+      exit: 0
+      stdout:
+        regex: "(?s)START.*END"
+
+  - name: regex_stderr
+    description: Regex matching on stderr
+    run:
+      cmd: sh
+      args: ["-c", "echo 'error: code E0123' >&2"]
+    expect:
+      exit: 0
+      stderr:
+        regex: "error: code E\\d+"

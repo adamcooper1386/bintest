@@ -1,0 +1,49 @@
+# Signal assertions (Unix only)
+# Test that processes are terminated by specific signals
+
+version: 1
+
+sandbox:
+  workdir: temp
+
+tests:
+  - name: sigkill
+    description: Process terminates with SIGKILL (9)
+    run:
+      cmd: sh
+      args: ["-c", "kill -9 $$"]
+    expect:
+      signal: 9  # SIGKILL
+
+  - name: sigterm
+    description: Process terminates with SIGTERM (15)
+    run:
+      cmd: sh
+      args: ["-c", "kill -15 $$"]
+    expect:
+      signal: 15  # SIGTERM
+
+  - name: sigint
+    description: Process terminates with SIGINT (2)
+    run:
+      cmd: sh
+      args: ["-c", "kill -2 $$"]
+    expect:
+      signal: 2  # SIGINT
+
+  - name: sigsegv
+    description: Process terminates with segfault (11)
+    run:
+      cmd: sh
+      args: ["-c", "kill -11 $$"]
+    expect:
+      signal: 11  # SIGSEGV
+
+  - name: normal_exit_not_signal
+    description: Normal exit (for comparison)
+    run:
+      cmd: sh
+      args: ["-c", "exit 0"]
+    expect:
+      exit: 0
+      # No signal expected - process exits normally

@@ -1,0 +1,60 @@
+# Filesystem diff capture
+# Track what files were added, removed, or modified during test execution
+
+version: 1
+
+sandbox:
+  workdir: temp
+
+# Enable filesystem diff capture for all tests in this file
+capture_fs_diff: true
+
+setup:
+  - write_file:
+      path: existing.txt
+      contents: "original content"
+
+tests:
+  - name: capture_added_files
+    description: Shows files created during test execution
+    run:
+      cmd: sh
+      args: ["-c", "touch new_file.txt && mkdir -p subdir && touch subdir/nested.txt"]
+    expect:
+      exit: 0
+    # The test result will include fs_diff showing:
+    # added: [new_file.txt, subdir/, subdir/nested.txt]
+
+  - name: capture_modified_files
+    description: Shows files modified during test execution
+    run:
+      cmd: sh
+      args: ["-c", "echo 'modified content' > existing.txt"]
+    expect:
+      exit: 0
+    # The test result will include fs_diff showing:
+    # modified: [existing.txt]
+
+  - name: capture_removed_files
+    description: Shows files removed during test execution
+    setup:
+      - write_file:
+          path: to_delete.txt
+          contents: "will be deleted"
+    run:
+      cmd: rm
+      args: ["to_delete.txt"]
+    expect:
+      exit: 0
+    # The test result will include fs_diff showing:
+    # removed: [to_delete.txt]
+
+  - name: disable_for_specific_test
+    description: Disable fs_diff capture for this test only
+    capture_fs_diff: false
+    run:
+      cmd: touch
+      args: ["no_diff_tracked.txt"]
+    expect:
+      exit: 0
+    # No fs_diff will be captured for this test

@@ -1,0 +1,73 @@
+# Stdin input
+# Provide input to commands via stdin
+
+version: 1
+
+sandbox:
+  workdir: temp
+
+tests:
+  - name: stdin_basic
+    description: Pipe input to cat
+    run:
+      cmd: cat
+      stdin: "hello from stdin"
+    expect:
+      exit: 0
+      stdout: "hello from stdin"
+
+  - name: stdin_multiline
+    description: Multiline stdin input
+    run:
+      cmd: cat
+      stdin: |
+        line one
+        line two
+        line three
+    expect:
+      exit: 0
+      stdout:
+        contains: "line two"
+
+  - name: stdin_grep
+    description: Use stdin with grep
+    run:
+      cmd: grep
+      args: ["world"]
+      stdin: |
+        hello world
+        goodbye moon
+        hello world again
+    expect:
+      exit: 0
+      stdout:
+        contains: "hello world"
+
+  - name: stdin_wc
+    description: Count lines from stdin
+    run:
+      cmd: wc
+      args: ["-l"]
+      stdin: |
+        one
+        two
+        three
+    expect:
+      exit: 0
+      stdout:
+        contains: "3"
+
+  - name: stdin_head
+    description: Read first N lines from stdin
+    run:
+      cmd: head
+      args: ["-n", "2"]
+      stdin: |
+        first
+        second
+        third
+    expect:
+      exit: 0
+      stdout: |
+        first
+        second

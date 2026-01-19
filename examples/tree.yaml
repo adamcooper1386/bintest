@@ -1,0 +1,64 @@
+# Directory tree snapshot assertions
+# Verify the complete filesystem structure after test execution
+
+version: 1
+
+sandbox:
+  workdir: temp
+
+tests:
+  - name: tree_contains
+    description: Check that specific paths exist in the tree
+    run:
+      cmd: sh
+      args: ["-c", "mkdir -p src && touch src/main.rs src/lib.rs && touch Cargo.toml"]
+    expect:
+      exit: 0
+      tree:
+        contains:
+          - path: src/main.rs
+          - path: src/lib.rs
+          - path: Cargo.toml
+
+  - name: tree_excludes
+    description: Check that certain paths do NOT exist
+    run:
+      cmd: sh
+      args: ["-c", "mkdir -p src && touch src/main.rs"]
+    expect:
+      exit: 0
+      tree:
+        contains:
+          - path: src/main.rs
+        excludes:
+          - target/
+          - node_modules/
+
+  - name: tree_with_contents
+    description: Check tree paths and their contents
+    run:
+      cmd: sh
+      args: ["-c", "mkdir -p src && echo '[package]' > Cargo.toml && echo 'fn main() {}' > src/main.rs"]
+    expect:
+      exit: 0
+      tree:
+        contains:
+          - path: Cargo.toml
+            contents:
+              contains: "[package]"
+          - path: src/main.rs
+            contents:
+              contains: "fn main"
+
+  - name: tree_exact_mode
+    description: Strict mode - only listed files should exist in subdirectory
+    run:
+      cmd: sh
+      args: ["-c", "mkdir -p exact_test && echo hello > exact_test/greeting.txt"]
+    expect:
+      exit: 0
+      tree:
+        root: exact_test
+        exact: true
+        contains:
+          - path: greeting.txt
