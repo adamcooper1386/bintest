@@ -918,6 +918,33 @@ fn check_sql_expect(
                     return;
                 }
 
+                // Check returns_null
+                if let Some(true) = sql_expect.returns_null {
+                    let is_null = result.trim().eq_ignore_ascii_case("null");
+                    if !is_null {
+                        failures.push(format!(
+                            "{prefix}: expected NULL result\n  Query: {query}\n  Got: {result:?}"
+                        ));
+                    }
+                    return;
+                }
+
+                // Check returns_one_row
+                if let Some(true) = sql_expect.returns_one_row {
+                    let row_count = if result.is_empty() {
+                        0
+                    } else {
+                        result.lines().count()
+                    };
+                    if row_count != 1 {
+                        failures.push(format!(
+                            "{prefix}: expected exactly one row\n  Query: {query}\n  Got: {} row(s)",
+                            row_count
+                        ));
+                    }
+                    return;
+                }
+
                 // Check returns
                 if let Some(returns) = &sql_expect.returns
                     && let Err(e) = check_sql_returns(&prefix, query, &result, returns)

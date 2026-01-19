@@ -95,6 +95,38 @@ tests:
         - query: "SELECT * FROM users WHERE name = 'nonexistent'"
           returns_empty: true
 
+  # Test returns_null assertion
+  - name: query_returns_null
+    serial: true
+    setup:
+      - sql:
+          database: default
+          statements:
+            - "CREATE TABLE nullable_test (id INTEGER PRIMARY KEY, value TEXT)"
+            - "INSERT INTO nullable_test (id, value) VALUES (1, NULL)"
+    run:
+      cmd: echo
+      args: ["NULL value check"]
+    expect:
+      sql:
+        - query: "SELECT value FROM nullable_test WHERE id = 1"
+          returns_null: true
+    teardown:
+      - sql:
+          database: default
+          statements:
+            - "DROP TABLE nullable_test"
+
+  # Test returns_one_row assertion
+  - name: query_returns_one_row
+    run:
+      cmd: echo
+      args: ["Single row check"]
+    expect:
+      sql:
+        - query: "SELECT * FROM users WHERE name = 'alice'"
+          returns_one_row: true
+
   # Test with setup SQL in test (must be serial since it modifies state)
   - name: test_with_sql_setup
     serial: true

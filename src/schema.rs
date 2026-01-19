@@ -637,6 +637,14 @@ pub struct SqlExpect {
     #[serde(default)]
     pub returns_empty: Option<bool>,
 
+    /// Assert that the query returns a NULL value.
+    #[serde(default)]
+    pub returns_null: Option<bool>,
+
+    /// Assert that the query returns exactly one row.
+    #[serde(default)]
+    pub returns_one_row: Option<bool>,
+
     /// Shorthand: check if a table exists.
     #[serde(default)]
     pub table_exists: Option<String>,
