@@ -12,6 +12,8 @@ pub enum LoadError {
     Io(std::io::Error),
     /// Failed to parse YAML.
     Yaml(serde_yaml::Error),
+    /// Failed to parse TOML.
+    Toml(toml::de::Error),
     /// Unsupported file extension.
     UnsupportedFormat(String),
 }
@@ -21,8 +23,12 @@ impl std::fmt::Display for LoadError {
         match self {
             LoadError::Io(e) => write!(f, "failed to read file: {e}"),
             LoadError::Yaml(e) => write!(f, "invalid YAML: {e}"),
+            LoadError::Toml(e) => write!(f, "invalid TOML: {e}"),
             LoadError::UnsupportedFormat(ext) => {
-                write!(f, "unsupported file format: {ext} (expected .yaml or .yml)")
+                write!(
+                    f,
+                    "unsupported file format: {ext} (expected .yaml, .yml, or .toml)"
+                )
             }
         }
     }
@@ -36,12 +42,11 @@ pub const SUITE_CONFIG_FILENAME: &str = "bintest.yaml";
 /// Load a test spec from a file path.
 pub fn load_spec(path: &Path) -> Result<TestSpec, LoadError> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let contents = std::fs::read_to_string(path).map_err(LoadError::Io)?;
 
     match ext {
-        "yaml" | "yml" => {
-            let contents = std::fs::read_to_string(path).map_err(LoadError::Io)?;
-            serde_yaml::from_str(&contents).map_err(LoadError::Yaml)
-        }
+        "yaml" | "yml" => serde_yaml::from_str(&contents).map_err(LoadError::Yaml),
+        "toml" => toml::from_str(&contents).map_err(LoadError::Toml),
         other => Err(LoadError::UnsupportedFormat(other.to_string())),
     }
 }
@@ -85,7 +90,7 @@ fn collect_specs_recursive(
         if path.is_dir() {
             collect_specs_recursive(&path, specs)?;
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
-            && (ext == "yaml" || ext == "yml")
+            && (ext == "yaml" || ext == "yml" || ext == "toml")
         {
             // Skip suite config file
             if path.file_name().is_some_and(|f| f == SUITE_CONFIG_FILENAME) {
@@ -148,14 +153,52 @@ tests:
     }
 
     #[test]
+    fn load_valid_toml_spec() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.toml");
+        std::fs::write(
+            &path,
+            r#"
+version = 1
+
+[[tests]]
+name = "test1"
+
+[tests.run]
+cmd = "echo"
+
+[tests.expect]
+exit = 0
+"#,
+        )
+        .unwrap();
+
+        let spec = load_spec(&path).unwrap();
+        assert_eq!(spec.version, 1);
+        assert_eq!(spec.tests.len(), 1);
+        assert_eq!(spec.tests[0].name, "test1");
+    }
+
+    #[test]
+    fn load_invalid_toml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "invalid = [toml").unwrap();
+
+        let result = load_spec(&path);
+        assert!(matches!(result, Err(LoadError::Toml(_))));
+    }
+
+    #[test]
     fn find_specs_in_directory() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.yaml"), "").unwrap();
         std::fs::write(dir.path().join("b.yml"), "").unwrap();
-        std::fs::write(dir.path().join("c.txt"), "").unwrap();
+        std::fs::write(dir.path().join("c.toml"), "").unwrap();
+        std::fs::write(dir.path().join("d.txt"), "").unwrap();
 
         let specs = find_specs(dir.path()).unwrap();
-        assert_eq!(specs.len(), 2);
+        assert_eq!(specs.len(), 3);
     }
 
     #[test]

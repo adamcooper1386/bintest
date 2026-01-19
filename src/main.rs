@@ -3,9 +3,11 @@ mod runner;
 mod schema;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
+use std::time::Duration;
 
 #[derive(Clone, Copy, Default, ValueEnum)]
 enum OutputFormat {
@@ -14,6 +16,8 @@ enum OutputFormat {
     Human,
     /// Machine-readable JSON output
     Json,
+    /// JUnit XML output for CI systems
+    Junit,
 }
 
 #[derive(Parser)]
@@ -101,6 +105,9 @@ fn main() {
                 .map(|p| (p.clone(), loader::load_spec(p)))
                 .collect();
 
+            // Track total execution time
+            let run_start = std::time::Instant::now();
+
             // Run specs (parallel by default, serial if configured)
             let file_results: Vec<(PathBuf, Result<runner::SpecResult, String>)> = if run_serial {
                 // Serial execution
@@ -147,7 +154,8 @@ fn main() {
                     .cmp(&spec_paths.iter().position(|p| p == &b.0))
             });
 
-            let mut all_results = Vec::new();
+            let mut json_results = Vec::new();
+            let mut junit_results = Vec::new();
             let mut total_passed = 0;
             let mut total_failed = 0;
 
@@ -157,38 +165,62 @@ fn main() {
                         if matches!(output, OutputFormat::Human) {
                             eprintln!("✗ Failed to load {}: {e}", spec_path.display());
                         }
+                        // For JUnit, create a synthetic failed test for load errors
+                        if matches!(output, OutputFormat::Junit) {
+                            junit_results.push(JunitFileResult {
+                                file: spec_path.display().to_string(),
+                                tests: vec![runner::TestResult {
+                                    name: "<load>".to_string(),
+                                    passed: false,
+                                    duration: Duration::ZERO,
+                                    failures: vec![format!("Failed to load spec: {e}")],
+                                }],
+                                total_time: Duration::ZERO,
+                            });
+                        }
                         total_failed += 1;
                     }
-                    Ok(spec_result) => match output {
-                        OutputFormat::Human => {
-                            println!("\n{}", spec_path.display());
-                            for test in &spec_result.tests {
-                                if test.passed {
-                                    println!("  ✓ {} ({:.2?})", test.name, test.duration);
-                                    total_passed += 1;
-                                } else {
-                                    println!("  ✗ {} ({:.2?})", test.name, test.duration);
-                                    for failure in &test.failures {
-                                        println!("    {failure}");
+                    Ok(spec_result) => {
+                        let file_time: Duration =
+                            spec_result.tests.iter().map(|t| t.duration).sum();
+
+                        for test in &spec_result.tests {
+                            if test.passed {
+                                total_passed += 1;
+                            } else {
+                                total_failed += 1;
+                            }
+                        }
+
+                        match output {
+                            OutputFormat::Human => {
+                                println!("\n{}", spec_path.display());
+                                for test in &spec_result.tests {
+                                    if test.passed {
+                                        println!("  ✓ {} ({:.2?})", test.name, test.duration);
+                                    } else {
+                                        println!("  ✗ {} ({:.2?})", test.name, test.duration);
+                                        for failure in &test.failures {
+                                            println!("    {failure}");
+                                        }
                                     }
-                                    total_failed += 1;
                                 }
                             }
-                        }
-                        OutputFormat::Json => {
-                            for test in &spec_result.tests {
-                                if test.passed {
-                                    total_passed += 1;
-                                } else {
-                                    total_failed += 1;
-                                }
+                            OutputFormat::Json => {
+                                json_results.push(serde_json::json!({
+                                    "file": spec_path.display().to_string(),
+                                    "tests": spec_result.tests,
+                                }));
                             }
-                            all_results.push(serde_json::json!({
-                                "file": spec_path.display().to_string(),
-                                "tests": spec_result.tests,
-                            }));
+                            OutputFormat::Junit => {
+                                junit_results.push(JunitFileResult {
+                                    file: spec_path.display().to_string(),
+                                    tests: spec_result.tests,
+                                    total_time: file_time,
+                                });
+                            }
                         }
-                    },
+                    }
                 }
             }
 
@@ -202,6 +234,8 @@ fn main() {
                 total_failed += 1;
             }
 
+            let total_time = run_start.elapsed();
+
             match output {
                 OutputFormat::Human => {
                     println!("\n{total_passed} passed, {total_failed} failed");
@@ -210,12 +244,15 @@ fn main() {
                     let output = serde_json::json!({
                         "passed": total_passed,
                         "failed": total_failed,
-                        "results": all_results,
+                        "results": json_results,
                     });
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&output).expect("Failed to serialize")
                     );
+                }
+                OutputFormat::Junit => {
+                    print!("{}", format_junit_xml(&junit_results, total_time));
                 }
             }
 
@@ -308,4 +345,80 @@ tests:
             println!("{json}");
         }
     }
+}
+
+/// A file result for JUnit output.
+struct JunitFileResult {
+    file: String,
+    tests: Vec<runner::TestResult>,
+    total_time: Duration,
+}
+
+/// Format test results as JUnit XML.
+fn format_junit_xml(results: &[JunitFileResult], total_time: Duration) -> String {
+    let mut xml = String::new();
+    xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+
+    let total_tests: usize = results.iter().map(|r| r.tests.len()).sum();
+    let total_failures: usize = results
+        .iter()
+        .flat_map(|r| &r.tests)
+        .filter(|t| !t.passed)
+        .count();
+
+    let _ = writeln!(
+        xml,
+        "<testsuites tests=\"{total_tests}\" failures=\"{total_failures}\" time=\"{:.3}\">",
+        total_time.as_secs_f64()
+    );
+
+    for file_result in results {
+        let tests = file_result.tests.len();
+        let failures = file_result.tests.iter().filter(|t| !t.passed).count();
+
+        let _ = writeln!(
+            xml,
+            "  <testsuite name=\"{}\" tests=\"{tests}\" failures=\"{failures}\" time=\"{:.3}\">",
+            escape_xml(&file_result.file),
+            file_result.total_time.as_secs_f64()
+        );
+
+        for test in &file_result.tests {
+            let _ = writeln!(
+                xml,
+                "    <testcase name=\"{}\" time=\"{:.3}\">",
+                escape_xml(&test.name),
+                test.duration.as_secs_f64()
+            );
+
+            if !test.passed {
+                let message = test
+                    .failures
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("Test failed");
+                let _ = writeln!(xml, "      <failure message=\"{}\">", escape_xml(message));
+                for failure in &test.failures {
+                    let _ = writeln!(xml, "{}", escape_xml(failure));
+                }
+                xml.push_str("      </failure>\n");
+            }
+
+            xml.push_str("    </testcase>\n");
+        }
+
+        xml.push_str("  </testsuite>\n");
+    }
+
+    xml.push_str("</testsuites>\n");
+    xml
+}
+
+/// Escape special XML characters.
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
