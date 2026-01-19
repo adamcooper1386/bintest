@@ -38,6 +38,12 @@ enum Command {
         /// Output format
         #[arg(short, long, default_value = "human")]
         output: OutputFormat,
+        /// Filter tests by name pattern (substring match)
+        #[arg(short, long)]
+        filter: Option<String>,
+        /// Show verbose output (command details, full diffs)
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Validate test specs without running them
     Validate {
@@ -58,7 +64,17 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run { path, output } => {
+        Command::Run {
+            path,
+            output,
+            filter,
+            verbose,
+        } => {
+            // Show filter info in verbose mode
+            if verbose && let Some(ref f) = filter {
+                eprintln!("Filtering tests by: {f:?}");
+            }
+
             // Determine the test root directory for suite config
             let test_root = if path.is_file() {
                 path.parent().unwrap_or(&path)
@@ -109,13 +125,18 @@ fn main() {
             let run_start = std::time::Instant::now();
 
             // Run specs (parallel by default, serial if configured)
+            let filter_ref = filter.as_deref();
             let file_results: Vec<(PathBuf, Result<runner::SpecResult, String>)> = if run_serial {
                 // Serial execution
                 specs_with_paths
                     .into_iter()
                     .map(|(path, spec_result)| {
                         let result = match spec_result {
-                            Ok(spec) => Ok(runner::run_spec(&spec, suite_config.as_ref())),
+                            Ok(spec) => Ok(runner::run_spec_filtered(
+                                &spec,
+                                suite_config.as_ref(),
+                                filter_ref,
+                            )),
                             Err(e) => Err(e.to_string()),
                         };
                         (path, result)
@@ -130,7 +151,11 @@ fn main() {
                             let suite_config_ref = suite_config.as_ref();
                             s.spawn(move || {
                                 let result = match spec_result {
-                                    Ok(spec) => Ok(runner::run_spec(&spec, suite_config_ref)),
+                                    Ok(spec) => Ok(runner::run_spec_filtered(
+                                        &spec,
+                                        suite_config_ref,
+                                        filter_ref,
+                                    )),
                                     Err(e) => Err(e.to_string()),
                                 };
                                 (path, result)
@@ -207,20 +232,48 @@ fn main() {
                                     }
                                     // Show filesystem diff if captured
                                     if let Some(ref diff) = test.fs_diff {
-                                        let mut diff_parts = Vec::new();
-                                        if !diff.added.is_empty() {
-                                            diff_parts.push(format!("+{} added", diff.added.len()));
-                                        }
-                                        if !diff.removed.is_empty() {
-                                            diff_parts
-                                                .push(format!("-{} removed", diff.removed.len()));
-                                        }
-                                        if !diff.modified.is_empty() {
-                                            diff_parts
-                                                .push(format!("~{} modified", diff.modified.len()));
-                                        }
-                                        if !diff_parts.is_empty() {
-                                            println!("    fs: {}", diff_parts.join(", "));
+                                        if verbose {
+                                            // Verbose mode: show full file paths
+                                            if !diff.added.is_empty() {
+                                                println!("    fs added:");
+                                                for path in &diff.added {
+                                                    println!("      + {}", path.display());
+                                                }
+                                            }
+                                            if !diff.removed.is_empty() {
+                                                println!("    fs removed:");
+                                                for path in &diff.removed {
+                                                    println!("      - {}", path.display());
+                                                }
+                                            }
+                                            if !diff.modified.is_empty() {
+                                                println!("    fs modified:");
+                                                for path in &diff.modified {
+                                                    println!("      ~ {}", path.display());
+                                                }
+                                            }
+                                        } else {
+                                            // Normal mode: show summary
+                                            let mut diff_parts = Vec::new();
+                                            if !diff.added.is_empty() {
+                                                diff_parts
+                                                    .push(format!("+{} added", diff.added.len()));
+                                            }
+                                            if !diff.removed.is_empty() {
+                                                diff_parts.push(format!(
+                                                    "-{} removed",
+                                                    diff.removed.len()
+                                                ));
+                                            }
+                                            if !diff.modified.is_empty() {
+                                                diff_parts.push(format!(
+                                                    "~{} modified",
+                                                    diff.modified.len()
+                                                ));
+                                            }
+                                            if !diff_parts.is_empty() {
+                                                println!("    fs: {}", diff_parts.join(", "));
+                                            }
                                         }
                                     }
                                 }

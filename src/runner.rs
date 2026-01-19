@@ -147,13 +147,27 @@ impl EffectiveConfig {
 }
 
 /// Run a test specification file with optional suite configuration.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_spec(spec: &TestSpec, suite_config: Option<&SuiteConfig>) -> SpecResult {
+    run_spec_filtered(spec, suite_config, None)
+}
+
+/// Run a test specification file with optional suite configuration and filter.
+pub fn run_spec_filtered(
+    spec: &TestSpec,
+    suite_config: Option<&SuiteConfig>,
+    filter: Option<&str>,
+) -> SpecResult {
     let effective = EffectiveConfig::from_suite(suite_config);
-    run_spec_with_config(spec, &effective)
+    run_spec_with_config(spec, &effective, filter)
 }
 
 /// Run a test specification file with effective configuration.
-fn run_spec_with_config(spec: &TestSpec, effective: &EffectiveConfig) -> SpecResult {
+fn run_spec_with_config(
+    spec: &TestSpec,
+    effective: &EffectiveConfig,
+    filter: Option<&str>,
+) -> SpecResult {
     // Merge suite env with sandbox env (sandbox takes precedence)
     let mut merged_sandbox = spec.sandbox.clone();
     for (k, v) in &effective.suite_env {
@@ -201,11 +215,22 @@ fn run_spec_with_config(spec: &TestSpec, effective: &EffectiveConfig) -> SpecRes
         };
     }
 
-    // Partition tests into serial and parallel groups, preserving indices
-    let (serial_tests, parallel_tests): (Vec<_>, Vec<_>) = spec
+    // Filter tests by name if a filter is provided
+    let filtered_tests: Vec<(usize, &Test)> = spec
         .tests
         .iter()
         .enumerate()
+        .filter(|(_, test)| filter.map(|f| test.name.contains(f)).unwrap_or(true))
+        .collect();
+
+    // If no tests match the filter, return empty results
+    if filtered_tests.is_empty() {
+        return SpecResult { tests: vec![] };
+    }
+
+    // Partition tests into serial and parallel groups, preserving indices
+    let (serial_tests, parallel_tests): (Vec<_>, Vec<_>) = filtered_tests
+        .into_iter()
         .partition(|(_, test)| test.serial);
 
     // Collect results with their indices
