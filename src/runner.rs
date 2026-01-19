@@ -1297,6 +1297,7 @@ mod tests {
             timeout: Some(1),
             env: HashMap::new(),
             inherit_env: None,
+            serial: false,
             setup: vec![],
             teardown: vec![],
         };
@@ -1320,6 +1321,7 @@ mod tests {
             timeout: None,
             env: suite_env,
             inherit_env: None,
+            serial: false,
             setup: vec![],
             teardown: vec![],
         };
@@ -1347,6 +1349,7 @@ mod tests {
             timeout: None,
             env: suite_env,
             inherit_env: None,
+            serial: false,
             setup: vec![],
             teardown: vec![],
         };
@@ -1374,6 +1377,7 @@ mod tests {
             timeout: Some(10), // Suite says 10 seconds
             env: HashMap::new(),
             inherit_env: None,
+            serial: false,
             setup: vec![],
             teardown: vec![],
         };

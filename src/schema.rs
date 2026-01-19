@@ -29,6 +29,11 @@ pub struct SuiteConfig {
     #[serde(default)]
     pub inherit_env: Option<bool>,
 
+    /// Run spec files serially instead of in parallel (default: false).
+    /// When false (default), spec files run in parallel for faster execution.
+    #[serde(default)]
+    pub serial: bool,
+
     /// Setup steps run before the entire suite.
     #[serde(default)]
     pub setup: Vec<SetupStep>,

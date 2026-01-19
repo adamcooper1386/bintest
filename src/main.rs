@@ -5,6 +5,7 @@ mod schema;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fs;
 use std::path::PathBuf;
+use std::thread;
 
 #[derive(Clone, Copy, Default, ValueEnum)]
 enum OutputFormat {
@@ -70,7 +71,7 @@ fn main() {
                 }
             };
 
-            let specs = match loader::find_specs(&path) {
+            let spec_paths = match loader::find_specs(&path) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error finding specs: {e}");
@@ -78,7 +79,7 @@ fn main() {
                 }
             };
 
-            if specs.is_empty() {
+            if spec_paths.is_empty() {
                 eprintln!("No spec files found at: {}", path.display());
                 std::process::exit(1);
             }
@@ -91,53 +92,103 @@ fn main() {
                 std::process::exit(1);
             }
 
+            // Determine if we should run files serially
+            let run_serial = suite_config.as_ref().is_some_and(|c| c.serial);
+
+            // Load all specs first, tracking any load failures
+            let specs_with_paths: Vec<_> = spec_paths
+                .iter()
+                .map(|p| (p.clone(), loader::load_spec(p)))
+                .collect();
+
+            // Run specs (parallel by default, serial if configured)
+            let file_results: Vec<(PathBuf, Result<runner::SpecResult, String>)> = if run_serial {
+                // Serial execution
+                specs_with_paths
+                    .into_iter()
+                    .map(|(path, spec_result)| {
+                        let result = match spec_result {
+                            Ok(spec) => Ok(runner::run_spec(&spec, suite_config.as_ref())),
+                            Err(e) => Err(e.to_string()),
+                        };
+                        (path, result)
+                    })
+                    .collect()
+            } else {
+                // Parallel execution (default)
+                thread::scope(|s| {
+                    let handles: Vec<_> = specs_with_paths
+                        .into_iter()
+                        .map(|(path, spec_result)| {
+                            let suite_config_ref = suite_config.as_ref();
+                            s.spawn(move || {
+                                let result = match spec_result {
+                                    Ok(spec) => Ok(runner::run_spec(&spec, suite_config_ref)),
+                                    Err(e) => Err(e.to_string()),
+                                };
+                                (path, result)
+                            })
+                        })
+                        .collect();
+
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("Spec thread panicked"))
+                        .collect()
+                })
+            };
+
+            // Sort results by original path order for deterministic output
+            let mut sorted_results: Vec<_> = file_results;
+            sorted_results.sort_by(|a, b| {
+                spec_paths
+                    .iter()
+                    .position(|p| p == &a.0)
+                    .cmp(&spec_paths.iter().position(|p| p == &b.0))
+            });
+
             let mut all_results = Vec::new();
             let mut total_passed = 0;
             let mut total_failed = 0;
 
-            for spec_path in &specs {
-                let spec = match loader::load_spec(spec_path) {
-                    Ok(s) => s,
+            for (spec_path, result) in sorted_results {
+                match result {
                     Err(e) => {
                         if matches!(output, OutputFormat::Human) {
                             eprintln!("✗ Failed to load {}: {e}", spec_path.display());
                         }
                         total_failed += 1;
-                        continue;
                     }
-                };
-
-                let result = runner::run_spec(&spec, suite_config.as_ref());
-
-                match output {
-                    OutputFormat::Human => {
-                        println!("\n{}", spec_path.display());
-                        for test in &result.tests {
-                            if test.passed {
-                                println!("  ✓ {} ({:.2?})", test.name, test.duration);
-                                total_passed += 1;
-                            } else {
-                                println!("  ✗ {} ({:.2?})", test.name, test.duration);
-                                for failure in &test.failures {
-                                    println!("    {failure}");
+                    Ok(spec_result) => match output {
+                        OutputFormat::Human => {
+                            println!("\n{}", spec_path.display());
+                            for test in &spec_result.tests {
+                                if test.passed {
+                                    println!("  ✓ {} ({:.2?})", test.name, test.duration);
+                                    total_passed += 1;
+                                } else {
+                                    println!("  ✗ {} ({:.2?})", test.name, test.duration);
+                                    for failure in &test.failures {
+                                        println!("    {failure}");
+                                    }
+                                    total_failed += 1;
                                 }
-                                total_failed += 1;
                             }
                         }
-                    }
-                    OutputFormat::Json => {
-                        for test in &result.tests {
-                            if test.passed {
-                                total_passed += 1;
-                            } else {
-                                total_failed += 1;
+                        OutputFormat::Json => {
+                            for test in &spec_result.tests {
+                                if test.passed {
+                                    total_passed += 1;
+                                } else {
+                                    total_failed += 1;
+                                }
                             }
+                            all_results.push(serde_json::json!({
+                                "file": spec_path.display().to_string(),
+                                "tests": spec_result.tests,
+                            }));
                         }
-                        all_results.push(serde_json::json!({
-                            "file": spec_path.display().to_string(),
-                            "tests": result.tests,
-                        }));
-                    }
+                    },
                 }
             }
 
