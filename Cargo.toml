@@ -2,6 +2,12 @@
 name = "bintest"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "A declarative integration test runner for executables"
+repository = "https://github.com/adamcooper1386/bintest"
+readme = "README.md"
+keywords = ["testing", "cli", "integration-tests", "yaml"]
+categories = ["development-tools::testing"]
 
 [dependencies]
 chrono = "0.4"
