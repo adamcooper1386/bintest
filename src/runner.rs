@@ -4,7 +4,7 @@
 
 use crate::database::ConnectionManager;
 use crate::schema::{
-    DatabaseConfig, DbDriver, Expect, FileExpect, OutputMatch, OutputMatchStructured,
+    Condition, DatabaseConfig, DbDriver, Expect, FileExpect, OutputMatch, OutputMatchStructured,
     RowCountExpect, Run, RunStep, Sandbox, SandboxDir, SetupStep, SqlExpect, SqlOnError,
     SqlReturns, SqlReturnsStructured, SuiteConfig, TeardownStep, Test, TestSpec, TreeExpect,
     WorkDir,
@@ -30,6 +30,12 @@ pub struct SpecResult {
 pub struct TestResult {
     pub name: String,
     pub passed: bool,
+    /// Whether the test was skipped due to skip_if or require conditions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
+    /// Reason for skipping the test (if skipped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
     #[serde(serialize_with = "serialize_duration")]
     pub duration: Duration,
     pub failures: Vec<String>,
@@ -66,6 +72,88 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_f64(duration.as_secs_f64())
+}
+
+// ============================================================================
+// Conditional Execution
+// ============================================================================
+
+/// Result of evaluating skip/require conditions for a test.
+#[derive(Debug)]
+enum ConditionResult {
+    /// Test should run.
+    Run,
+    /// Test should be skipped with the given reason.
+    Skip(String),
+}
+
+/// Check if a condition is satisfied.
+///
+/// For `env` conditions: checks if the environment variable is set (non-empty).
+/// For `cmd` conditions: checks if the command exits with code 0.
+fn check_condition(condition: &Condition) -> bool {
+    if let Some(env_var) = &condition.env {
+        // Check if environment variable is set and non-empty
+        return std::env::var(env_var)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+    }
+
+    if let Some(cmd) = &condition.cmd {
+        // Parse command string and execute
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        if parts.is_empty() {
+            return false;
+        }
+
+        let result = Command::new(parts[0])
+            .args(&parts[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        return result.is_ok_and(|status| status.success());
+    }
+
+    // If no condition type is specified, treat as satisfied
+    true
+}
+
+/// Evaluate skip_if and require conditions for a test.
+///
+/// Returns `ConditionResult::Run` if the test should run, or
+/// `ConditionResult::Skip(reason)` if it should be skipped.
+fn evaluate_conditions(test: &Test) -> ConditionResult {
+    // Check skip_if conditions - skip if ANY condition is true
+    for condition in &test.skip_if {
+        if check_condition(condition) {
+            let reason = if let Some(env_var) = &condition.env {
+                format!("skip_if: environment variable '{}' is set", env_var)
+            } else if let Some(cmd) = &condition.cmd {
+                format!("skip_if: command '{}' succeeded", cmd)
+            } else {
+                "skip_if: condition met".to_string()
+            };
+            return ConditionResult::Skip(reason);
+        }
+    }
+
+    // Check require conditions - skip if ANY condition is NOT met
+    for condition in &test.require {
+        if !check_condition(condition) {
+            let reason = if let Some(env_var) = &condition.env {
+                format!("require: environment variable '{}' is not set", env_var)
+            } else if let Some(cmd) = &condition.cmd {
+                format!("require: command '{}' failed or not found", cmd)
+            } else {
+                "require: condition not met".to_string()
+            };
+            return ConditionResult::Skip(reason);
+        }
+    }
+
+    ConditionResult::Run
 }
 
 /// Run suite-level setup steps.
@@ -236,6 +324,8 @@ fn run_spec_with_config(
                 tests: vec![TestResult {
                     name: "<setup>".to_string(),
                     passed: false,
+                    skipped: false,
+                    skip_reason: None,
                     duration: Duration::ZERO,
                     failures: vec![format!("Failed to create sandbox: {e}")],
                     failed_step: None,
@@ -260,6 +350,8 @@ fn run_spec_with_config(
             tests: vec![TestResult {
                 name: "<setup>".to_string(),
                 passed: false,
+                skipped: false,
+                skip_reason: None,
                 duration: Duration::ZERO,
                 failures: vec![format!("Setup failed: {e}")],
                 failed_step: None,
@@ -329,6 +421,8 @@ fn run_spec_with_config(
         results.push(TestResult {
             name: "<teardown>".to_string(),
             passed: false,
+            skipped: false,
+            skip_reason: None,
             duration: Duration::ZERO,
             failures: vec![format!("Teardown failed: {e}")],
             failed_step: None,
@@ -353,6 +447,23 @@ fn run_test(
     let mut failures = Vec::new();
     let mut failed_step: Option<StepFailure> = None;
 
+    // Check skip_if and require conditions
+    match evaluate_conditions(test) {
+        ConditionResult::Skip(reason) => {
+            return TestResult {
+                name: test.name.clone(),
+                passed: true, // Skipped tests count as passed
+                skipped: true,
+                skip_reason: Some(reason),
+                duration: start.elapsed(),
+                failures: vec![],
+                failed_step: None,
+                fs_diff: None,
+            };
+        }
+        ConditionResult::Run => {}
+    }
+
     // Determine if we should capture fs diff (test overrides file)
     let capture_fs_diff = test.capture_fs_diff.unwrap_or(file_capture_fs_diff);
 
@@ -361,6 +472,8 @@ fn run_test(
         return TestResult {
             name: test.name.clone(),
             passed: false,
+            skipped: false,
+            skip_reason: None,
             duration: start.elapsed(),
             failures: vec![format!("Test setup failed: {e}")],
             failed_step: None,
@@ -474,6 +587,8 @@ fn run_test(
     TestResult {
         name: test.name.clone(),
         passed: failures.is_empty(),
+        skipped: false,
+        skip_reason: None,
         duration: start.elapsed(),
         failures,
         failed_step,
@@ -1449,6 +1564,8 @@ mod tests {
         Test {
             name: name.to_string(),
             description: None,
+            skip_if: vec![],
+            require: vec![],
             setup: vec![],
             steps: vec![Step {
                 name: "run".to_string(),

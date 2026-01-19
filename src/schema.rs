@@ -335,6 +335,25 @@ pub struct Step {
     pub teardown: Vec<TeardownStep>,
 }
 
+// ============================================================================
+// Conditional Execution Types
+// ============================================================================
+
+/// A condition for conditional test execution.
+///
+/// Conditions can check environment variables or command availability.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct Condition {
+    /// Environment variable that must be set (for require) or must be set (for skip_if).
+    #[serde(default)]
+    pub env: Option<String>,
+
+    /// Command that must succeed (exit 0) for require, or must succeed for skip_if.
+    #[serde(default)]
+    pub cmd: Option<String>,
+}
+
 /// Helper enum for deserializing both test formats.
 /// Only used during deserialization, not stored, so the size difference is acceptable.
 #[derive(Debug, Clone, Deserialize)]
@@ -346,6 +365,10 @@ enum TestFormat {
         name: String,
         #[serde(default)]
         description: Option<String>,
+        #[serde(default)]
+        skip_if: Vec<Condition>,
+        #[serde(default)]
+        require: Vec<Condition>,
         #[serde(default)]
         setup: Vec<SetupStep>,
         steps: Vec<Step>,
@@ -363,6 +386,10 @@ enum TestFormat {
         name: String,
         #[serde(default)]
         description: Option<String>,
+        #[serde(default)]
+        skip_if: Vec<Condition>,
+        #[serde(default)]
+        require: Vec<Condition>,
         #[serde(default)]
         setup: Vec<SetupStep>,
         run: Run,
@@ -394,6 +421,16 @@ pub struct Test {
     /// Optional description.
     #[serde(default)]
     pub description: Option<String>,
+
+    /// Conditions that cause the test to be skipped if ANY are true.
+    /// Use for skipping tests in certain environments (e.g., skip_if env: CI).
+    #[serde(default)]
+    pub skip_if: Vec<Condition>,
+
+    /// Conditions that must ALL be met for the test to run.
+    /// Use for requiring dependencies (e.g., require env: DATABASE_URL).
+    #[serde(default)]
+    pub require: Vec<Condition>,
 
     /// Test-level setup steps (run once before all steps).
     #[serde(default)]
@@ -429,6 +466,8 @@ impl<'de> Deserialize<'de> for Test {
             TestFormat::MultiStep {
                 name,
                 description,
+                skip_if,
+                require,
                 setup,
                 steps,
                 teardown,
@@ -438,6 +477,8 @@ impl<'de> Deserialize<'de> for Test {
             } => Test {
                 name,
                 description,
+                skip_if,
+                require,
                 setup,
                 steps,
                 teardown,
@@ -448,6 +489,8 @@ impl<'de> Deserialize<'de> for Test {
             TestFormat::SingleStep {
                 name,
                 description,
+                skip_if,
+                require,
                 setup,
                 run,
                 expect,
@@ -460,6 +503,8 @@ impl<'de> Deserialize<'de> for Test {
                 Test {
                     name,
                     description,
+                    skip_if,
+                    require,
                     setup,
                     steps: vec![Step {
                         name: "run".to_string(),
@@ -989,5 +1034,69 @@ tests:
         let sqlite_db = spec.databases.get("sqlite_test").unwrap();
         assert_eq!(sqlite_db.driver, DbDriver::Sqlite);
         assert_eq!(sqlite_db.url, "sqlite::memory:");
+    }
+
+    #[test]
+    fn parse_conditional_execution() {
+        let yaml = r#"
+version: 1
+tests:
+  - name: requires_database
+    require:
+      - env: DATABASE_URL
+      - cmd: psql --version
+    run:
+      cmd: echo
+      args: ["database test"]
+    expect:
+      exit: 0
+
+  - name: skip_in_ci
+    skip_if:
+      - env: CI
+    run:
+      cmd: echo
+      args: ["local only test"]
+    expect:
+      exit: 0
+
+  - name: multi_step_with_conditions
+    require:
+      - env: API_KEY
+    skip_if:
+      - env: SKIP_SLOW_TESTS
+    steps:
+      - name: step_one
+        run:
+          cmd: echo
+          args: ["one"]
+        expect:
+          exit: 0
+"#;
+        let spec: TestSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.tests.len(), 3);
+
+        // First test: require conditions
+        let test1 = &spec.tests[0];
+        assert_eq!(test1.name, "requires_database");
+        assert_eq!(test1.require.len(), 2);
+        assert_eq!(test1.require[0].env, Some("DATABASE_URL".to_string()));
+        assert_eq!(test1.require[1].cmd, Some("psql --version".to_string()));
+        assert!(test1.skip_if.is_empty());
+
+        // Second test: skip_if conditions
+        let test2 = &spec.tests[1];
+        assert_eq!(test2.name, "skip_in_ci");
+        assert_eq!(test2.skip_if.len(), 1);
+        assert_eq!(test2.skip_if[0].env, Some("CI".to_string()));
+        assert!(test2.require.is_empty());
+
+        // Third test: both conditions on multi-step
+        let test3 = &spec.tests[2];
+        assert_eq!(test3.name, "multi_step_with_conditions");
+        assert_eq!(test3.require.len(), 1);
+        assert_eq!(test3.require[0].env, Some("API_KEY".to_string()));
+        assert_eq!(test3.skip_if.len(), 1);
+        assert_eq!(test3.skip_if[0].env, Some("SKIP_SLOW_TESTS".to_string()));
     }
 }

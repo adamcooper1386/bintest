@@ -201,6 +201,7 @@ fn main() {
             let mut junit_results = Vec::new();
             let mut total_passed = 0;
             let mut total_failed = 0;
+            let mut total_skipped = 0;
 
             for (spec_path, result) in sorted_results {
                 match result {
@@ -215,6 +216,8 @@ fn main() {
                                 tests: vec![runner::TestResult {
                                     name: "<load>".to_string(),
                                     passed: false,
+                                    skipped: false,
+                                    skip_reason: None,
                                     duration: Duration::ZERO,
                                     failures: vec![format!("Failed to load spec: {e}")],
                                     failed_step: None,
@@ -230,7 +233,9 @@ fn main() {
                             spec_result.tests.iter().map(|t| t.duration).sum();
 
                         for test in &spec_result.tests {
-                            if test.passed {
+                            if test.skipped {
+                                total_skipped += 1;
+                            } else if test.passed {
                                 total_passed += 1;
                             } else {
                                 total_failed += 1;
@@ -241,7 +246,13 @@ fn main() {
                             OutputFormat::Human => {
                                 println!("\n{}", spec_path.display());
                                 for test in &spec_result.tests {
-                                    if test.passed {
+                                    if test.skipped {
+                                        print!("  ⊘ {} (skipped)", test.name);
+                                        if let Some(ref reason) = test.skip_reason {
+                                            print!(" - {reason}");
+                                        }
+                                        println!();
+                                    } else if test.passed {
                                         println!("  ✓ {} ({:.2?})", test.name, test.duration);
                                     } else {
                                         println!("  ✗ {} ({:.2?})", test.name, test.duration);
@@ -329,12 +340,20 @@ fn main() {
 
             match output {
                 OutputFormat::Human => {
-                    println!("\n{total_passed} passed, {total_failed} failed");
+                    let mut summary_parts = vec![
+                        format!("{total_passed} passed"),
+                        format!("{total_failed} failed"),
+                    ];
+                    if total_skipped > 0 {
+                        summary_parts.push(format!("{total_skipped} skipped"));
+                    }
+                    println!("\n{}", summary_parts.join(", "));
                 }
                 OutputFormat::Json => {
                     let output = serde_json::json!({
                         "passed": total_passed,
                         "failed": total_failed,
+                        "skipped": total_skipped,
                         "results": json_results,
                     });
                     println!(

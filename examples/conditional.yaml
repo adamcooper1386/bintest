@@ -1,0 +1,106 @@
+# Conditional test execution example
+#
+# This example demonstrates how to conditionally skip or require tests
+# based on environment variables or command availability.
+
+version: 1
+
+tests:
+  # This test requires an environment variable to be set
+  # It will be skipped if DATABASE_URL is not defined
+  - name: requires_database_url
+    require:
+      - env: DATABASE_URL
+    run:
+      cmd: echo
+      args: ["Database URL is set"]
+    expect:
+      exit: 0
+
+  # This test requires a command to be available
+  # It will be skipped if 'git' command is not found
+  - name: requires_git
+    require:
+      - cmd: git --version
+    run:
+      cmd: git
+      args: ["--version"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "git version"
+
+  # This test is skipped when running in CI
+  # Set CI=true to see it get skipped
+  - name: skip_in_ci
+    skip_if:
+      - env: CI
+    run:
+      cmd: echo
+      args: ["This runs locally but not in CI"]
+    expect:
+      exit: 0
+
+  # This test is skipped when a specific feature flag is set
+  - name: skip_when_feature_disabled
+    skip_if:
+      - env: SKIP_SLOW_TESTS
+    run:
+      cmd: echo
+      args: ["Running slow test..."]
+    expect:
+      exit: 0
+
+  # Multiple require conditions (ALL must be met)
+  - name: requires_multiple_env_vars
+    require:
+      - env: HOME
+      - env: PATH
+    run:
+      cmd: echo
+      args: ["Both HOME and PATH are set"]
+    expect:
+      exit: 0
+
+  # Combining skip_if and require
+  # This test requires git but is skipped in CI
+  - name: local_git_test
+    require:
+      - cmd: git --version
+    skip_if:
+      - env: CI
+    run:
+      cmd: git
+      args: ["--version"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "git version"
+
+  # This test will always be skipped (nonexistent command)
+  - name: requires_nonexistent_command
+    require:
+      - cmd: nonexistent_command_12345 --version
+    run:
+      cmd: echo
+      args: ["This will never run"]
+    expect:
+      exit: 0
+
+  # Multi-step test with conditions
+  - name: conditional_multi_step
+    require:
+      - env: HOME
+    steps:
+      - name: first_step
+        run:
+          cmd: echo
+          args: ["Step 1"]
+        expect:
+          exit: 0
+      - name: second_step
+        run:
+          cmd: echo
+          args: ["Step 2"]
+        expect:
+          exit: 0
