@@ -249,9 +249,14 @@ pub struct Run {
 /// Expected outcomes from a test execution.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Expect {
-    /// Expected exit code (default: 0).
+    /// Expected exit code (default: 0 if no signal expected).
     #[serde(default)]
     pub exit: Option<i32>,
+
+    /// Expected signal that terminated the process (e.g., 9 for SIGKILL, 15 for SIGTERM).
+    /// If set, exit code is ignored and the process must have been killed by this signal.
+    #[serde(default)]
+    pub signal: Option<i32>,
 
     /// Expected stdout content.
     #[serde(default)]

@@ -351,7 +351,10 @@ fn run_test(
 }
 
 struct CommandOutput {
-    exit_code: i32,
+    /// Exit code if process exited normally.
+    exit_code: Option<i32>,
+    /// Signal number if process was terminated by a signal (Unix only).
+    signal: Option<i32>,
     stdout: String,
     stderr: String,
 }
@@ -419,8 +422,20 @@ fn run_command(
                 let output = child
                     .wait_with_output()
                     .map_err(|e| format!("Failed to read output: {e}"))?;
+
+                // Get exit code and signal
+                let exit_code = status.code();
+                #[cfg(unix)]
+                let signal = {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal()
+                };
+                #[cfg(not(unix))]
+                let signal = None;
+
                 return Ok(CommandOutput {
-                    exit_code: status.code().unwrap_or(-1),
+                    exit_code,
+                    signal,
                     stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                     stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                 });
@@ -443,13 +458,49 @@ fn check_expectations(
     ctx: &ExecutionContext,
     failures: &mut Vec<String>,
 ) {
-    // Check exit code
-    let expected_exit = expect.exit.unwrap_or(0);
-    if output.exit_code != expected_exit {
-        failures.push(format!(
-            "Exit code: expected {expected_exit}, got {}",
-            output.exit_code
-        ));
+    // Check signal or exit code (signal takes precedence if specified)
+    if let Some(expected_signal) = expect.signal {
+        // Expecting a signal termination
+        match output.signal {
+            Some(actual_signal) => {
+                if actual_signal != expected_signal {
+                    failures.push(format!(
+                        "Signal: expected {expected_signal}, got {actual_signal}"
+                    ));
+                }
+            }
+            None => {
+                let exit_info = output
+                    .exit_code
+                    .map(|c| format!("exit code {c}"))
+                    .unwrap_or_else(|| "unknown".to_string());
+                failures.push(format!(
+                    "Signal: expected {expected_signal}, but process exited with {exit_info}"
+                ));
+            }
+        }
+    } else {
+        // Expecting normal exit (default behavior)
+        let expected_exit = expect.exit.unwrap_or(0);
+        match output.exit_code {
+            Some(actual_exit) => {
+                if actual_exit != expected_exit {
+                    failures.push(format!(
+                        "Exit code: expected {expected_exit}, got {actual_exit}"
+                    ));
+                }
+            }
+            None => {
+                // Process was killed by a signal when we expected an exit code
+                let signal_info = output
+                    .signal
+                    .map(|s| format!("signal {s}"))
+                    .unwrap_or_else(|| "unknown cause".to_string());
+                failures.push(format!(
+                    "Exit code: expected {expected_exit}, but process was terminated by {signal_info}"
+                ));
+            }
+        }
     }
 
     // Check stdout
@@ -1469,6 +1520,67 @@ mod tests {
 
         assert!(!result.tests[0].passed);
         assert!(result.tests[0].failures[0].contains("timed out"));
+    }
+
+    // ==================== Signal Tests ====================
+
+    #[test]
+    #[cfg(unix)]
+    fn test_signal_assertion_passes() {
+        // Test that expects SIGKILL (9) - use sh to send kill signal to itself
+        let mut test = make_test(
+            "signal_test",
+            "sh",
+            vec!["-c", "kill -9 $$"], // $$ is the shell's PID
+        );
+        test.expect.signal = Some(9); // SIGKILL
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_signal_assertion_wrong_signal() {
+        // Test expects SIGTERM (15) but gets SIGKILL (9)
+        let mut test = make_test("signal_mismatch", "sh", vec!["-c", "kill -9 $$"]);
+        test.expect.signal = Some(15); // SIGTERM
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("Signal: expected 15, got 9"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_signal_expected_but_normal_exit() {
+        // Test expects a signal but process exits normally
+        let mut test = make_test("signal_expected_normal_exit", "true", vec![]);
+        test.expect.signal = Some(9);
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("but process exited with exit code 0"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_exit_expected_but_signal_received() {
+        // Test expects exit code 0 but gets killed by signal
+        let mut test = make_test("exit_expected_signal", "sh", vec!["-c", "kill -9 $$"]);
+        test.expect.exit = Some(0);
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(result.tests[0].failures[0].contains("terminated by signal 9"));
     }
 
     // ==================== Multiple Tests ====================
