@@ -181,6 +181,10 @@ pub struct SetupStep {
     #[serde(default)]
     pub copy_file: Option<CopyFile>,
 
+    /// Copy a directory recursively from source to destination.
+    #[serde(default)]
+    pub copy_dir: Option<CopyDir>,
+
     /// Run an arbitrary command.
     #[serde(default)]
     pub run: Option<RunStep>,
@@ -222,6 +226,16 @@ pub struct CopyFile {
     pub from: PathBuf,
 
     /// Destination path.
+    pub to: PathBuf,
+}
+
+/// Copy a directory recursively from one location to another.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CopyDir {
+    /// Source directory path.
+    pub from: PathBuf,
+
+    /// Destination directory path.
     pub to: PathBuf,
 }
 

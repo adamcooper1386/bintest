@@ -1,0 +1,44 @@
+version: 1
+
+sandbox:
+  workdir: temp
+
+setup:
+  # Create a source directory structure
+  - create_dir: source/nested
+  - write_file:
+      path: source/root.txt
+      contents: "root file content"
+  - write_file:
+      path: source/nested/deep.txt
+      contents: "deeply nested content"
+  # Copy the entire directory
+  - copy_dir:
+      from: source
+      to: dest
+
+tests:
+  - name: copy_dir_preserves_structure
+    run:
+      cmd: find
+      args: ["dest", "-type", "f"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "dest/root.txt"
+
+  - name: copy_dir_preserves_nested_files
+    run:
+      cmd: cat
+      args: ["dest/nested/deep.txt"]
+    expect:
+      exit: 0
+      stdout: "deeply nested content"
+
+  - name: copy_dir_preserves_root_files
+    run:
+      cmd: cat
+      args: ["dest/root.txt"]
+    expect:
+      exit: 0
+      stdout: "root file content"

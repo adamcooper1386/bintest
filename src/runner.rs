@@ -815,6 +815,23 @@ fn check_tree_expect(tree_expect: &TreeExpect, ctx: &ExecutionContext, failures:
     }
 }
 
+/// Recursively copy a directory and all its contents.
+fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
 /// Recursively collect all files in a directory.
 fn collect_files_recursive(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -953,6 +970,18 @@ fn run_setup_step(step: &SetupStep, ctx: &ExecutionContext) -> Result<(), String
         })?;
     }
 
+    if let Some(copy) = &step.copy_dir {
+        copy_dir_recursive(&ctx.resolve_path(&copy.from), &ctx.resolve_path(&copy.to)).map_err(
+            |e| {
+                format!(
+                    "Failed to copy directory {} to {}: {e}",
+                    copy.from.display(),
+                    copy.to.display()
+                )
+            },
+        )?;
+    }
+
     if let Some(run) = &step.run {
         run_simple_command(run, ctx)?;
     }
@@ -1030,7 +1059,7 @@ fn run_simple_command(run: &RunStep, ctx: &ExecutionContext) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{CopyFile, Step, WriteFile};
+    use crate::schema::{CopyDir, CopyFile, Step, WriteFile};
 
     /// Helper to create a minimal test spec with one test.
     fn make_spec(test: Test) -> TestSpec {
@@ -1387,6 +1416,7 @@ mod tests {
             }),
             create_dir: None,
             copy_file: None,
+            copy_dir: None,
             run: None,
         }];
         let result = run_spec_standalone(&spec);
@@ -1407,6 +1437,7 @@ mod tests {
             write_file: None,
             create_dir: Some(PathBuf::from("subdir")),
             copy_file: None,
+            copy_dir: None,
             run: None,
         }];
         let result = run_spec_standalone(&spec);
@@ -1429,6 +1460,7 @@ mod tests {
             }),
             create_dir: None,
             copy_file: None,
+            copy_dir: None,
             run: None,
         }];
         let spec = make_spec(test);
@@ -1454,6 +1486,7 @@ mod tests {
                 }),
                 create_dir: None,
                 copy_file: None,
+                copy_dir: None,
                 run: None,
             },
             SetupStep {
@@ -1463,6 +1496,7 @@ mod tests {
                     from: PathBuf::from("source.txt"),
                     to: PathBuf::from("dest.txt"),
                 }),
+                copy_dir: None,
                 run: None,
             },
         ];
@@ -1488,6 +1522,7 @@ mod tests {
             write_file: None,
             create_dir: None,
             copy_file: None,
+            copy_dir: None,
             run: Some(RunStep {
                 cmd: "sh".to_string(),
                 args: vec![
@@ -1496,6 +1531,69 @@ mod tests {
                 ],
             }),
         }];
+        let result = run_spec_standalone(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_setup_copy_dir() {
+        // Test that copy_dir recursively copies a directory
+        let mut test = make_test(
+            "read_copied_dir",
+            "sh",
+            vec!["-c", "cat dest/sub/nested.txt && cat dest/root.txt"],
+        );
+        test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: Some("nested content".to_string()),
+            regex: None,
+        }));
+        let mut spec = make_spec(test);
+        // First create source directory structure, then copy it
+        spec.setup = vec![
+            SetupStep {
+                write_file: None,
+                create_dir: Some(PathBuf::from("source/sub")),
+                copy_file: None,
+                copy_dir: None,
+                run: None,
+            },
+            SetupStep {
+                write_file: Some(WriteFile {
+                    path: PathBuf::from("source/root.txt"),
+                    contents: "root content\n".to_string(),
+                }),
+                create_dir: None,
+                copy_file: None,
+                copy_dir: None,
+                run: None,
+            },
+            SetupStep {
+                write_file: Some(WriteFile {
+                    path: PathBuf::from("source/sub/nested.txt"),
+                    contents: "nested content\n".to_string(),
+                }),
+                create_dir: None,
+                copy_file: None,
+                copy_dir: None,
+                run: None,
+            },
+            SetupStep {
+                write_file: None,
+                create_dir: None,
+                copy_file: None,
+                copy_dir: Some(CopyDir {
+                    from: PathBuf::from("source"),
+                    to: PathBuf::from("dest"),
+                }),
+                run: None,
+            },
+        ];
         let result = run_spec_standalone(&spec);
 
         assert!(
@@ -1781,6 +1879,7 @@ mod tests {
             write_file: None,
             create_dir: Some(PathBuf::from("subdir")),
             copy_file: None,
+            copy_dir: None,
             run: None,
         }];
         let result = run_spec_standalone(&spec);
@@ -2143,6 +2242,7 @@ mod tests {
             }),
             create_dir: None,
             copy_file: None,
+            copy_dir: None,
             run: None,
         }];
         let spec = make_spec(test);
@@ -2171,6 +2271,7 @@ mod tests {
             }),
             create_dir: None,
             copy_file: None,
+            copy_dir: None,
             run: None,
         }];
         let spec = make_spec(test);
