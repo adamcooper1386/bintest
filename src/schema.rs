@@ -34,6 +34,11 @@ pub struct SuiteConfig {
     #[serde(default)]
     pub serial: bool,
 
+    /// Capture filesystem diffs for all tests (default: false).
+    /// Shows what files were added, removed, or modified during test execution.
+    #[serde(default)]
+    pub capture_fs_diff: bool,
+
     /// Setup steps run before the entire suite.
     #[serde(default)]
     pub setup: Vec<SetupStep>,
@@ -60,6 +65,10 @@ pub struct TestSpec {
     /// Default timeout in seconds for tests in this file.
     #[serde(default)]
     pub timeout: Option<u64>,
+
+    /// Capture filesystem diffs for tests in this file (overrides suite setting).
+    #[serde(default)]
+    pub capture_fs_diff: Option<bool>,
 
     /// Setup steps run before all tests in this file.
     #[serde(default)]
@@ -204,6 +213,10 @@ pub struct Test {
     /// Whether this test must run serially (not in parallel).
     #[serde(default)]
     pub serial: bool,
+
+    /// Capture filesystem diff for this test (overrides file/suite setting).
+    #[serde(default)]
+    pub capture_fs_diff: Option<bool>,
 }
 
 /// Command execution configuration.
@@ -251,6 +264,10 @@ pub struct Expect {
     /// Expected filesystem state.
     #[serde(default)]
     pub files: Vec<FileExpect>,
+
+    /// Expected directory tree structure.
+    #[serde(default)]
+    pub tree: Option<TreeExpect>,
 }
 
 /// Matching rules for stdout/stderr.
@@ -291,6 +308,37 @@ pub struct FileExpect {
     pub exists: Option<bool>,
 
     /// Expected file contents.
+    #[serde(default)]
+    pub contents: Option<OutputMatch>,
+}
+
+/// Expected directory tree structure after test execution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct TreeExpect {
+    /// Root directory to check (relative to sandbox, defaults to sandbox root).
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+
+    /// Paths that must exist in the tree.
+    #[serde(default)]
+    pub contains: Vec<TreeEntry>,
+
+    /// Paths that must not exist in the tree.
+    #[serde(default)]
+    pub excludes: Vec<PathBuf>,
+
+    /// If true, only paths in `contains` should exist (no extra files).
+    #[serde(default)]
+    pub exact: bool,
+}
+
+/// An entry in a tree expectation.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TreeEntry {
+    /// Path to the file or directory (relative to tree root).
+    pub path: PathBuf,
+
+    /// Expected file contents (only for files, not directories).
     #[serde(default)]
     pub contents: Option<OutputMatch>,
 }

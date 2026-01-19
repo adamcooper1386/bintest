@@ -174,6 +174,7 @@ fn main() {
                                     passed: false,
                                     duration: Duration::ZERO,
                                     failures: vec![format!("Failed to load spec: {e}")],
+                                    fs_diff: None,
                                 }],
                                 total_time: Duration::ZERO,
                             });
@@ -202,6 +203,24 @@ fn main() {
                                         println!("  ✗ {} ({:.2?})", test.name, test.duration);
                                         for failure in &test.failures {
                                             println!("    {failure}");
+                                        }
+                                    }
+                                    // Show filesystem diff if captured
+                                    if let Some(ref diff) = test.fs_diff {
+                                        let mut diff_parts = Vec::new();
+                                        if !diff.added.is_empty() {
+                                            diff_parts.push(format!("+{} added", diff.added.len()));
+                                        }
+                                        if !diff.removed.is_empty() {
+                                            diff_parts
+                                                .push(format!("-{} removed", diff.removed.len()));
+                                        }
+                                        if !diff.modified.is_empty() {
+                                            diff_parts
+                                                .push(format!("~{} modified", diff.modified.len()));
+                                        }
+                                        if !diff_parts.is_empty() {
+                                            println!("    fs: {}", diff_parts.join(", "));
                                         }
                                     }
                                 }
@@ -402,6 +421,36 @@ fn format_junit_xml(results: &[JunitFileResult], total_time: Duration) -> String
                     let _ = writeln!(xml, "{}", escape_xml(failure));
                 }
                 xml.push_str("      </failure>\n");
+            }
+
+            // Include filesystem diff as system-out if present
+            if let Some(ref diff) = test.fs_diff {
+                let mut diff_output = String::new();
+                if !diff.added.is_empty() {
+                    diff_output.push_str("Added:\n");
+                    for path in &diff.added {
+                        let _ = writeln!(diff_output, "  + {}", path.display());
+                    }
+                }
+                if !diff.removed.is_empty() {
+                    diff_output.push_str("Removed:\n");
+                    for path in &diff.removed {
+                        let _ = writeln!(diff_output, "  - {}", path.display());
+                    }
+                }
+                if !diff.modified.is_empty() {
+                    diff_output.push_str("Modified:\n");
+                    for path in &diff.modified {
+                        let _ = writeln!(diff_output, "  ~ {}", path.display());
+                    }
+                }
+                if !diff_output.is_empty() {
+                    let _ = writeln!(
+                        xml,
+                        "      <system-out>{}</system-out>",
+                        escape_xml(&diff_output)
+                    );
+                }
             }
 
             xml.push_str("    </testcase>\n");

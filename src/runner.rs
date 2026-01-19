@@ -4,7 +4,7 @@
 
 use crate::schema::{
     Expect, FileExpect, OutputMatch, OutputMatchStructured, Run, RunStep, Sandbox, SetupStep,
-    SuiteConfig, TeardownStep, Test, TestSpec, WorkDir,
+    SuiteConfig, TeardownStep, Test, TestSpec, TreeExpect, WorkDir,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -30,6 +30,20 @@ pub struct TestResult {
     #[serde(serialize_with = "serialize_duration")]
     pub duration: Duration,
     pub failures: Vec<String>,
+    /// Filesystem changes during test execution (if capture_fs_diff enabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fs_diff: Option<FilesystemDiff>,
+}
+
+/// Filesystem changes captured during test execution.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FilesystemDiff {
+    /// Files that were created during test execution.
+    pub added: Vec<PathBuf>,
+    /// Files that were deleted during test execution.
+    pub removed: Vec<PathBuf>,
+    /// Files that were modified during test execution.
+    pub modified: Vec<PathBuf>,
 }
 
 fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
@@ -113,6 +127,8 @@ pub struct EffectiveConfig {
     pub suite_env: HashMap<String, String>,
     /// Whether to inherit env from host (suite-level default).
     pub inherit_env: Option<bool>,
+    /// Whether to capture filesystem diffs (suite-level default).
+    pub capture_fs_diff: bool,
 }
 
 impl EffectiveConfig {
@@ -123,6 +139,7 @@ impl EffectiveConfig {
                 default_timeout: cfg.timeout,
                 suite_env: cfg.env.clone(),
                 inherit_env: cfg.inherit_env,
+                capture_fs_diff: cfg.capture_fs_diff,
             },
             None => Self::default(),
         }
@@ -153,6 +170,9 @@ fn run_spec_with_config(spec: &TestSpec, effective: &EffectiveConfig) -> SpecRes
     // Determine file-level default timeout
     let file_timeout = spec.timeout.or(effective.default_timeout);
 
+    // Determine file-level capture_fs_diff (file overrides suite)
+    let file_capture_fs_diff = spec.capture_fs_diff.unwrap_or(effective.capture_fs_diff);
+
     let ctx = match ExecutionContext::new(&merged_sandbox) {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -162,6 +182,7 @@ fn run_spec_with_config(spec: &TestSpec, effective: &EffectiveConfig) -> SpecRes
                     passed: false,
                     duration: Duration::ZERO,
                     failures: vec![format!("Failed to create sandbox: {e}")],
+                    fs_diff: None,
                 }],
             };
         }
@@ -175,6 +196,7 @@ fn run_spec_with_config(spec: &TestSpec, effective: &EffectiveConfig) -> SpecRes
                 passed: false,
                 duration: Duration::ZERO,
                 failures: vec![format!("Setup failed: {e}")],
+                fs_diff: None,
             }],
         };
     }
@@ -191,7 +213,7 @@ fn run_spec_with_config(spec: &TestSpec, effective: &EffectiveConfig) -> SpecRes
 
     // Run serial tests first, in order
     for (idx, test) in serial_tests {
-        let result = run_test(test, &ctx, file_timeout);
+        let result = run_test(test, &ctx, file_timeout, file_capture_fs_diff);
         indexed_results.push((idx, result));
     }
 
@@ -203,7 +225,12 @@ fn run_spec_with_config(spec: &TestSpec, effective: &EffectiveConfig) -> SpecRes
                 .iter()
                 .map(|(idx, test)| {
                     let idx = *idx;
-                    s.spawn(move || (idx, run_test(test, ctx_ref, file_timeout)))
+                    s.spawn(move || {
+                        (
+                            idx,
+                            run_test(test, ctx_ref, file_timeout, file_capture_fs_diff),
+                        )
+                    })
                 })
                 .collect();
 
@@ -225,15 +252,24 @@ fn run_spec_with_config(spec: &TestSpec, effective: &EffectiveConfig) -> SpecRes
             passed: false,
             duration: Duration::ZERO,
             failures: vec![format!("Teardown failed: {e}")],
+            fs_diff: None,
         });
     }
 
     SpecResult { tests: results }
 }
 
-fn run_test(test: &Test, ctx: &ExecutionContext, file_timeout: Option<u64>) -> TestResult {
+fn run_test(
+    test: &Test,
+    ctx: &ExecutionContext,
+    file_timeout: Option<u64>,
+    file_capture_fs_diff: bool,
+) -> TestResult {
     let start = Instant::now();
     let mut failures = Vec::new();
+
+    // Determine if we should capture fs diff (test overrides file)
+    let capture_fs_diff = test.capture_fs_diff.unwrap_or(file_capture_fs_diff);
 
     // Test-level setup
     if let Err(e) = run_setup_steps(&test.setup, ctx) {
@@ -242,8 +278,16 @@ fn run_test(test: &Test, ctx: &ExecutionContext, file_timeout: Option<u64>) -> T
             passed: false,
             duration: start.elapsed(),
             failures: vec![format!("Test setup failed: {e}")],
+            fs_diff: None,
         };
     }
+
+    // Capture filesystem state before command (if enabled)
+    let snapshot_before = if capture_fs_diff {
+        Some(snapshot_filesystem(&ctx.sandbox_dir))
+    } else {
+        None
+    };
 
     // Run the command - test timeout overrides file timeout overrides default
     let timeout_secs = test
@@ -261,6 +305,12 @@ fn run_test(test: &Test, ctx: &ExecutionContext, file_timeout: Option<u64>) -> T
         }
     }
 
+    // Compute filesystem diff (if enabled)
+    let fs_diff = snapshot_before.map(|before| {
+        let after = snapshot_filesystem(&ctx.sandbox_dir);
+        compute_fs_diff(&before, &after)
+    });
+
     // Test-level teardown (always runs)
     if let Err(e) = run_teardown_steps(&test.teardown, ctx) {
         failures.push(format!("Test teardown failed: {e}"));
@@ -271,6 +321,7 @@ fn run_test(test: &Test, ctx: &ExecutionContext, file_timeout: Option<u64>) -> T
         passed: failures.is_empty(),
         duration: start.elapsed(),
         failures,
+        fs_diff,
     }
 }
 
@@ -394,6 +445,11 @@ fn check_expectations(
     for file_expect in &expect.files {
         check_file_expect(file_expect, ctx, failures);
     }
+
+    // Check tree structure
+    if let Some(tree) = &expect.tree {
+        check_tree_expect(tree, ctx, failures);
+    }
 }
 
 fn check_output_match(name: &str, actual: &str, matcher: &OutputMatch) -> Result<(), String> {
@@ -478,6 +534,201 @@ fn check_file_expect(file_expect: &FileExpect, ctx: &ExecutionContext, failures:
                 ));
             }
         }
+    }
+}
+
+fn check_tree_expect(tree_expect: &TreeExpect, ctx: &ExecutionContext, failures: &mut Vec<String>) {
+    // Determine root directory to check
+    let root = tree_expect
+        .root
+        .as_ref()
+        .map(|p| ctx.resolve_path(p))
+        .unwrap_or_else(|| ctx.sandbox_dir.clone());
+
+    // Collect all files in the tree
+    let actual_files = collect_files_recursive(&root);
+
+    // Check that required paths exist
+    for entry in &tree_expect.contains {
+        let full_path = root.join(&entry.path);
+        if !full_path.exists() {
+            failures.push(format!(
+                "Tree: expected path to exist: {}",
+                entry.path.display()
+            ));
+            continue;
+        }
+
+        // Check contents if specified
+        if let Some(matcher) = &entry.contents {
+            if full_path.is_file() {
+                match std::fs::read_to_string(&full_path) {
+                    Ok(contents) => {
+                        let name = format!("tree:{}", entry.path.display());
+                        if let Err(e) = check_output_match(&name, &contents, matcher) {
+                            failures.push(e);
+                        }
+                    }
+                    Err(e) => {
+                        failures.push(format!(
+                            "Tree: failed to read {}: {e}",
+                            entry.path.display()
+                        ));
+                    }
+                }
+            } else {
+                failures.push(format!(
+                    "Tree: cannot check contents of directory: {}",
+                    entry.path.display()
+                ));
+            }
+        }
+    }
+
+    // Check that excluded paths don't exist
+    for excluded in &tree_expect.excludes {
+        let full_path = root.join(excluded);
+        if full_path.exists() {
+            failures.push(format!(
+                "Tree: expected path to not exist: {}",
+                excluded.display()
+            ));
+        }
+    }
+
+    // If exact mode, verify no unexpected files exist
+    if tree_expect.exact {
+        let expected_paths: std::collections::HashSet<_> = tree_expect
+            .contains
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+
+        for actual in &actual_files {
+            // Get relative path from root
+            if let Ok(relative) = actual.strip_prefix(&root) {
+                let relative_path = relative.to_path_buf();
+                // Check if this path or any parent is in expected_paths
+                let mut is_expected = false;
+                let mut check_path = relative_path.clone();
+                loop {
+                    if expected_paths.contains(&check_path) {
+                        is_expected = true;
+                        break;
+                    }
+                    match check_path.parent() {
+                        Some(parent) if !parent.as_os_str().is_empty() => {
+                            check_path = parent.to_path_buf();
+                        }
+                        _ => break,
+                    }
+                }
+                if !is_expected {
+                    failures.push(format!(
+                        "Tree: unexpected file in exact mode: {}",
+                        relative_path.display()
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Recursively collect all files in a directory.
+fn collect_files_recursive(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(collect_files_recursive(&path));
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// State of a file for diff comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileState {
+    /// Size in bytes.
+    size: u64,
+    /// Modification time (as duration since UNIX_EPOCH).
+    modified: Option<Duration>,
+}
+
+/// Snapshot the filesystem state of a directory.
+fn snapshot_filesystem(root: &Path) -> HashMap<PathBuf, FileState> {
+    let mut snapshot = HashMap::new();
+    snapshot_dir_recursive(root, root, &mut snapshot);
+    snapshot
+}
+
+fn snapshot_dir_recursive(root: &Path, dir: &Path, snapshot: &mut HashMap<PathBuf, FileState>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(relative) = path.strip_prefix(root)
+                && let Ok(metadata) = entry.metadata()
+            {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+                snapshot.insert(
+                    relative.to_path_buf(),
+                    FileState {
+                        size: metadata.len(),
+                        modified,
+                    },
+                );
+            }
+            if path.is_dir() {
+                snapshot_dir_recursive(root, &path, snapshot);
+            }
+        }
+    }
+}
+
+/// Compute the difference between two filesystem snapshots.
+fn compute_fs_diff(
+    before: &HashMap<PathBuf, FileState>,
+    after: &HashMap<PathBuf, FileState>,
+) -> FilesystemDiff {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut modified = Vec::new();
+
+    // Find added and modified files
+    for (path, after_state) in after {
+        match before.get(path) {
+            None => added.push(path.clone()),
+            Some(before_state) => {
+                if before_state != after_state {
+                    modified.push(path.clone());
+                }
+            }
+        }
+    }
+
+    // Find removed files
+    for path in before.keys() {
+        if !after.contains_key(path) {
+            removed.push(path.clone());
+        }
+    }
+
+    // Sort for deterministic output
+    added.sort();
+    removed.sort();
+    modified.sort();
+
+    FilesystemDiff {
+        added,
+        removed,
+        modified,
     }
 }
 
@@ -606,6 +857,7 @@ mod tests {
             version: 1,
             sandbox: Sandbox::default(),
             timeout: None,
+            capture_fs_diff: None,
             setup: vec![],
             tests: vec![test],
             teardown: vec![],
@@ -635,6 +887,7 @@ mod tests {
             teardown: vec![],
             timeout: None,
             serial: false,
+            capture_fs_diff: None,
         }
     }
 
@@ -1203,6 +1456,7 @@ mod tests {
             version: 1,
             sandbox: Sandbox::default(),
             timeout: None,
+            capture_fs_diff: None,
             setup: vec![],
             tests: vec![test1, test2],
             teardown: vec![],
@@ -1230,6 +1484,7 @@ mod tests {
             version: 1,
             sandbox: Sandbox::default(),
             timeout: None,
+            capture_fs_diff: None,
             setup: vec![],
             tests: vec![test1, test2],
             teardown: vec![],
@@ -1298,6 +1553,7 @@ mod tests {
             env: HashMap::new(),
             inherit_env: None,
             serial: false,
+            capture_fs_diff: false,
             setup: vec![],
             teardown: vec![],
         };
@@ -1322,6 +1578,7 @@ mod tests {
             env: suite_env,
             inherit_env: None,
             serial: false,
+            capture_fs_diff: false,
             setup: vec![],
             teardown: vec![],
         };
@@ -1350,6 +1607,7 @@ mod tests {
             env: suite_env,
             inherit_env: None,
             serial: false,
+            capture_fs_diff: false,
             setup: vec![],
             teardown: vec![],
         };
@@ -1378,6 +1636,7 @@ mod tests {
             env: HashMap::new(),
             inherit_env: None,
             serial: false,
+            capture_fs_diff: false,
             setup: vec![],
             teardown: vec![],
         };
@@ -1418,6 +1677,7 @@ mod tests {
             version: 1,
             sandbox: Sandbox::default(),
             timeout: None,
+            capture_fs_diff: None,
             setup: vec![],
             tests: vec![test1, test2],
             teardown: vec![],
@@ -1451,6 +1711,7 @@ mod tests {
             version: 1,
             sandbox: Sandbox::default(),
             timeout: None,
+            capture_fs_diff: None,
             setup: vec![],
             tests: vec![test1, test2],
             teardown: vec![],
@@ -1494,6 +1755,7 @@ mod tests {
             version: 1,
             sandbox: Sandbox::default(),
             timeout: None,
+            capture_fs_diff: None,
             setup: vec![],
             tests: vec![serial_test, parallel_test],
             teardown: vec![],
@@ -1527,6 +1789,7 @@ mod tests {
             version: 1,
             sandbox: Sandbox::default(),
             timeout: None,
+            capture_fs_diff: None,
             setup: vec![],
             tests: vec![test1, test2, test3],
             teardown: vec![],
@@ -1556,6 +1819,7 @@ mod tests {
             version: 1,
             sandbox: Sandbox::default(),
             timeout: None,
+            capture_fs_diff: None,
             setup: vec![],
             tests: vec![s1, p1, s2, p2],
             teardown: vec![],
@@ -1570,5 +1834,250 @@ mod tests {
         assert_eq!(result.tests[1].name, "parallel_1");
         assert_eq!(result.tests[2].name, "serial_2");
         assert_eq!(result.tests[3].name, "parallel_2");
+    }
+
+    // ==================== Filesystem Diff Tests ====================
+
+    #[test]
+    fn test_fs_diff_captures_added_files() {
+        let mut test = make_test("create_files", "sh", vec!["-c", "touch a.txt b.txt"]);
+        test.capture_fs_diff = Some(true);
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(result.tests[0].passed);
+        let diff = result.tests[0]
+            .fs_diff
+            .as_ref()
+            .expect("fs_diff should be captured");
+        assert!(
+            diff.added
+                .iter()
+                .any(|p| p.to_string_lossy().contains("a.txt"))
+        );
+        assert!(
+            diff.added
+                .iter()
+                .any(|p| p.to_string_lossy().contains("b.txt"))
+        );
+    }
+
+    #[test]
+    fn test_fs_diff_captures_modified_files() {
+        let mut test = make_test(
+            "modify_file",
+            "sh",
+            vec!["-c", "echo modified >> existing.txt"],
+        );
+        test.capture_fs_diff = Some(true);
+        test.setup = vec![SetupStep {
+            write_file: Some(WriteFile {
+                path: PathBuf::from("existing.txt"),
+                contents: "initial\n".to_string(),
+            }),
+            create_dir: None,
+            copy_file: None,
+            run: None,
+        }];
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(result.tests[0].passed);
+        let diff = result.tests[0]
+            .fs_diff
+            .as_ref()
+            .expect("fs_diff should be captured");
+        assert!(
+            diff.modified
+                .iter()
+                .any(|p| p.to_string_lossy().contains("existing.txt"))
+        );
+    }
+
+    #[test]
+    fn test_fs_diff_captures_removed_files() {
+        let mut test = make_test("remove_file", "rm", vec!["to_delete.txt"]);
+        test.capture_fs_diff = Some(true);
+        test.setup = vec![SetupStep {
+            write_file: Some(WriteFile {
+                path: PathBuf::from("to_delete.txt"),
+                contents: "delete me\n".to_string(),
+            }),
+            create_dir: None,
+            copy_file: None,
+            run: None,
+        }];
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(result.tests[0].passed);
+        let diff = result.tests[0]
+            .fs_diff
+            .as_ref()
+            .expect("fs_diff should be captured");
+        assert!(
+            diff.removed
+                .iter()
+                .any(|p| p.to_string_lossy().contains("to_delete.txt"))
+        );
+    }
+
+    #[test]
+    fn test_fs_diff_disabled_by_default() {
+        let test = make_test("no_diff", "touch", vec!["file.txt"]);
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(result.tests[0].passed);
+        assert!(result.tests[0].fs_diff.is_none());
+    }
+
+    #[test]
+    fn test_fs_diff_enabled_at_file_level() {
+        let test = make_test("file_level_diff", "touch", vec!["file.txt"]);
+        let mut spec = make_spec(test);
+        spec.capture_fs_diff = Some(true);
+        let result = run_spec_standalone(&spec);
+
+        assert!(result.tests[0].passed);
+        assert!(result.tests[0].fs_diff.is_some());
+    }
+
+    // ==================== Tree Expectation Tests ====================
+
+    #[test]
+    fn test_tree_contains_passes() {
+        use crate::schema::{TreeEntry, TreeExpect};
+
+        let mut test = make_test(
+            "create_tree",
+            "sh",
+            vec!["-c", "mkdir -p src && touch src/main.rs Cargo.toml"],
+        );
+        test.expect.tree = Some(TreeExpect {
+            root: None,
+            contains: vec![
+                TreeEntry {
+                    path: PathBuf::from("src/main.rs"),
+                    contents: None,
+                },
+                TreeEntry {
+                    path: PathBuf::from("Cargo.toml"),
+                    contents: None,
+                },
+            ],
+            excludes: vec![],
+            exact: false,
+        });
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_tree_contains_fails_on_missing() {
+        use crate::schema::{TreeEntry, TreeExpect};
+
+        let mut test = make_test("empty_tree", "true", vec![]);
+        test.expect.tree = Some(TreeExpect {
+            root: None,
+            contains: vec![TreeEntry {
+                path: PathBuf::from("missing.txt"),
+                contents: None,
+            }],
+            excludes: vec![],
+            exact: false,
+        });
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(
+            result.tests[0]
+                .failures
+                .iter()
+                .any(|f| f.contains("expected path to exist"))
+        );
+    }
+
+    #[test]
+    fn test_tree_excludes_passes() {
+        use crate::schema::TreeExpect;
+
+        let mut test = make_test("no_target", "true", vec![]);
+        test.expect.tree = Some(TreeExpect {
+            root: None,
+            contains: vec![],
+            excludes: vec![PathBuf::from("target/")],
+            exact: false,
+        });
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+    }
+
+    #[test]
+    fn test_tree_excludes_fails_on_present() {
+        use crate::schema::TreeExpect;
+
+        let mut test = make_test("creates_forbidden", "mkdir", vec!["forbidden"]);
+        test.expect.tree = Some(TreeExpect {
+            root: None,
+            contains: vec![],
+            excludes: vec![PathBuf::from("forbidden")],
+            exact: false,
+        });
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(!result.tests[0].passed);
+        assert!(
+            result.tests[0]
+                .failures
+                .iter()
+                .any(|f| f.contains("expected path to not exist"))
+        );
+    }
+
+    #[test]
+    fn test_tree_with_contents_check() {
+        use crate::schema::{TreeEntry, TreeExpect};
+
+        let mut test = make_test(
+            "create_with_content",
+            "sh",
+            vec!["-c", "echo 'hello world' > greeting.txt"],
+        );
+        test.expect.tree = Some(TreeExpect {
+            root: None,
+            contains: vec![TreeEntry {
+                path: PathBuf::from("greeting.txt"),
+                contents: Some(OutputMatch::Structured(OutputMatchStructured {
+                    equals: None,
+                    contains: Some("hello".to_string()),
+                    regex: None,
+                })),
+            }],
+            excludes: vec![],
+            exact: false,
+        });
+        let spec = make_spec(test);
+        let result = run_spec_standalone(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
     }
 }
