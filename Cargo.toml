@@ -13,7 +13,7 @@ categories = ["development-tools::testing"]
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 schemars = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

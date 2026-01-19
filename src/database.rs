@@ -325,12 +325,23 @@ fn connect(config: &DatabaseConfig, name: &str) -> Result<Connection, DbError> {
     }
 }
 
+/// A database snapshot stored in memory.
+///
+/// Currently only SQLite snapshots are supported.
+pub struct Snapshot {
+    /// In-memory SQLite database containing the snapshot.
+    data: rusqlite::Connection,
+}
+
 /// Manages database connections for a test file.
 ///
 /// Connections are lazily initialized on first use and pooled per-file.
+/// Also manages database snapshots for save/restore operations.
 pub struct ConnectionManager {
     configs: HashMap<String, DatabaseConfig>,
     connections: Arc<Mutex<HashMap<String, Connection>>>,
+    /// Named snapshots keyed by "database:snapshot_name".
+    snapshots: Arc<Mutex<HashMap<String, Snapshot>>>,
 }
 
 impl ConnectionManager {
@@ -342,6 +353,7 @@ impl ConnectionManager {
         Self {
             configs,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            snapshots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -398,10 +410,159 @@ impl ConnectionManager {
         self.configs.get(name).map(|c| c.driver)
     }
 
-    /// Close all connections.
+    /// Create a snapshot of the database state.
+    ///
+    /// Currently only supported for SQLite databases. The snapshot is stored
+    /// in memory and can be restored later using `restore_snapshot`.
+    pub fn create_snapshot(&self, database: &str, snapshot_name: &str) -> Result<(), DbError> {
+        // Check that the database is SQLite
+        let driver = self.get_driver(database).ok_or_else(|| DbError {
+            message: format!("Database '{database}' is not configured"),
+            database: Some(database.to_string()),
+            masked_url: None,
+        })?;
+
+        if driver != DbDriver::Sqlite {
+            return Err(DbError {
+                message: "Snapshots are only supported for SQLite databases".to_string(),
+                database: Some(database.to_string()),
+                masked_url: None,
+            });
+        }
+
+        // Get the connection
+        let connections = self.get(database)?;
+        let conn = connections.get(database).ok_or_else(|| DbError {
+            message: format!("Connection for '{database}' not found"),
+            database: Some(database.to_string()),
+            masked_url: None,
+        })?;
+
+        // Get the SQLite connection
+        let source_conn = match conn {
+            Connection::Sqlite(sqlite) => &sqlite.conn,
+            Connection::Postgres(_) => {
+                return Err(DbError {
+                    message: "Snapshots are only supported for SQLite databases".to_string(),
+                    database: Some(database.to_string()),
+                    masked_url: None,
+                });
+            }
+        };
+
+        // Create an in-memory database for the snapshot
+        let mut snapshot_conn = rusqlite::Connection::open_in_memory().map_err(|e| DbError {
+            message: format!("Failed to create snapshot database: {e}"),
+            database: Some(database.to_string()),
+            masked_url: None,
+        })?;
+
+        // Copy the source database to the snapshot using the backup API
+        {
+            let backup = rusqlite::backup::Backup::new(source_conn, &mut snapshot_conn)
+                .map_err(|e| DbError {
+                    message: format!("Failed to initialize backup: {e}"),
+                    database: Some(database.to_string()),
+                    masked_url: None,
+                })?;
+
+            backup
+                .run_to_completion(5, std::time::Duration::from_millis(10), None)
+                .map_err(|e| DbError {
+                    message: format!("Failed to complete backup: {e}"),
+                    database: Some(database.to_string()),
+                    masked_url: None,
+                })?;
+        }
+
+        // Store the snapshot
+        let key = format!("{database}:{snapshot_name}");
+        let mut snapshots = self.snapshots.lock().map_err(|_| DbError {
+            message: "Snapshot storage lock poisoned".to_string(),
+            database: Some(database.to_string()),
+            masked_url: None,
+        })?;
+
+        snapshots.insert(
+            key,
+            Snapshot {
+                data: snapshot_conn,
+            },
+        );
+        Ok(())
+    }
+
+    /// Restore a database from a previously created snapshot.
+    ///
+    /// The snapshot must have been created using `create_snapshot` earlier
+    /// in the same file execution.
+    pub fn restore_snapshot(&self, database: &str, snapshot_name: &str) -> Result<(), DbError> {
+        let key = format!("{database}:{snapshot_name}");
+
+        // Get the snapshot
+        let snapshots = self.snapshots.lock().map_err(|_| DbError {
+            message: "Snapshot storage lock poisoned".to_string(),
+            database: Some(database.to_string()),
+            masked_url: None,
+        })?;
+
+        let snapshot = snapshots.get(&key).ok_or_else(|| DbError {
+            message: format!("Snapshot '{snapshot_name}' not found for database '{database}'"),
+            database: Some(database.to_string()),
+            masked_url: None,
+        })?;
+
+        // Get the target connection
+        let mut connections = self.connections.lock().map_err(|_| DbError {
+            message: "Connection pool lock poisoned".to_string(),
+            database: Some(database.to_string()),
+            masked_url: None,
+        })?;
+
+        let conn = connections.get_mut(database).ok_or_else(|| DbError {
+            message: format!("Connection for '{database}' not found"),
+            database: Some(database.to_string()),
+            masked_url: None,
+        })?;
+
+        // Get the SQLite connection
+        let target_conn = match conn {
+            Connection::Sqlite(sqlite) => &mut sqlite.conn,
+            Connection::Postgres(_) => {
+                return Err(DbError {
+                    message: "Snapshots are only supported for SQLite databases".to_string(),
+                    database: Some(database.to_string()),
+                    masked_url: None,
+                });
+            }
+        };
+
+        // Restore from snapshot using backup API (snapshot -> target)
+        let backup =
+            rusqlite::backup::Backup::new(&snapshot.data, target_conn).map_err(|e| DbError {
+                message: format!("Failed to initialize restore: {e}"),
+                database: Some(database.to_string()),
+                masked_url: None,
+            })?;
+
+        backup
+            .run_to_completion(5, std::time::Duration::from_millis(10), None)
+            .map_err(|e| DbError {
+                message: format!("Failed to complete restore: {e}"),
+                database: Some(database.to_string()),
+                masked_url: None,
+            })?;
+
+        Ok(())
+    }
+
+    /// Close all connections and clear all snapshots.
     pub fn close_all(&self) {
         if let Ok(mut connections) = self.connections.lock() {
             connections.clear();
+        }
+        if let Ok(mut snapshots) = self.snapshots.lock() {
+            snapshots.clear();
         }
     }
 }
@@ -527,5 +688,139 @@ mod tests {
         // Unknown database
         let err = manager.execute("unknown", "SELECT 1").unwrap_err();
         assert!(err.message.contains("not configured"));
+    }
+
+    #[test]
+    fn test_snapshot_and_restore() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "default".to_string(),
+            DatabaseConfig {
+                driver: DbDriver::Sqlite,
+                url: "sqlite::memory:".to_string(),
+            },
+        );
+
+        let manager = ConnectionManager::new(configs);
+
+        // Create initial state
+        manager
+            .execute("default", "CREATE TABLE users (name TEXT)")
+            .unwrap();
+        manager
+            .execute("default", "INSERT INTO users VALUES ('alice')")
+            .unwrap();
+
+        // Verify initial state
+        let count = manager
+            .execute("default", "SELECT COUNT(*) FROM users")
+            .unwrap();
+        assert_eq!(count, "1");
+
+        // Create snapshot
+        manager.create_snapshot("default", "initial").unwrap();
+
+        // Modify state
+        manager
+            .execute("default", "INSERT INTO users VALUES ('bob')")
+            .unwrap();
+        manager
+            .execute("default", "INSERT INTO users VALUES ('charlie')")
+            .unwrap();
+
+        // Verify modified state
+        let count = manager
+            .execute("default", "SELECT COUNT(*) FROM users")
+            .unwrap();
+        assert_eq!(count, "3");
+
+        // Restore snapshot
+        manager.restore_snapshot("default", "initial").unwrap();
+
+        // Verify restored state
+        let count = manager
+            .execute("default", "SELECT COUNT(*) FROM users")
+            .unwrap();
+        assert_eq!(count, "1");
+        let name = manager
+            .execute("default", "SELECT name FROM users")
+            .unwrap();
+        assert_eq!(name, "alice");
+    }
+
+    #[test]
+    fn test_snapshot_not_found() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "default".to_string(),
+            DatabaseConfig {
+                driver: DbDriver::Sqlite,
+                url: "sqlite::memory:".to_string(),
+            },
+        );
+
+        let manager = ConnectionManager::new(configs);
+
+        // Try to restore non-existent snapshot
+        let err = manager
+            .restore_snapshot("default", "nonexistent")
+            .unwrap_err();
+        assert!(err.message.contains("not found"));
+    }
+
+    #[test]
+    fn test_multiple_snapshots() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "default".to_string(),
+            DatabaseConfig {
+                driver: DbDriver::Sqlite,
+                url: "sqlite::memory:".to_string(),
+            },
+        );
+
+        let manager = ConnectionManager::new(configs);
+
+        // Create table
+        manager
+            .execute("default", "CREATE TABLE counter (value INTEGER)")
+            .unwrap();
+        manager
+            .execute("default", "INSERT INTO counter VALUES (1)")
+            .unwrap();
+
+        // Snapshot at value=1
+        manager.create_snapshot("default", "snap1").unwrap();
+
+        // Update to value=2
+        manager
+            .execute("default", "UPDATE counter SET value = 2")
+            .unwrap();
+        manager.create_snapshot("default", "snap2").unwrap();
+
+        // Update to value=3
+        manager
+            .execute("default", "UPDATE counter SET value = 3")
+            .unwrap();
+
+        // Verify current state
+        let val = manager
+            .execute("default", "SELECT value FROM counter")
+            .unwrap();
+        assert_eq!(val, "3");
+
+        // Restore to snap1
+        manager.restore_snapshot("default", "snap1").unwrap();
+        let val = manager
+            .execute("default", "SELECT value FROM counter")
+            .unwrap();
+        assert_eq!(val, "1");
+
+        // Restore to snap2
+        manager.restore_snapshot("default", "snap2").unwrap();
+        let val = manager
+            .execute("default", "SELECT value FROM counter")
+            .unwrap();
+        assert_eq!(val, "2");
     }
 }

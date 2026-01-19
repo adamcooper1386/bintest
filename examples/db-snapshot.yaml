@@ -1,0 +1,149 @@
+# Database snapshot and restore example
+#
+# This example demonstrates how to save and restore database state
+# using db_snapshot and db_restore. Currently only SQLite is supported.
+#
+# Snapshots are useful for:
+# - Reverting to a known state after destructive tests
+# - Creating baselines for multi-step test workflows
+# - Avoiding repetitive setup SQL
+
+version: 1
+
+databases:
+  default:
+    driver: sqlite
+    url: "sqlite::memory:"
+
+setup:
+  # Create initial schema
+  - sql:
+      database: default
+      statements:
+        - "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)"
+        - "INSERT INTO users (name, active) VALUES ('alice', 1)"
+        - "INSERT INTO users (name, active) VALUES ('bob', 1)"
+
+  # Save initial state as "baseline" snapshot
+  - db_snapshot:
+      database: default
+      name: baseline
+
+tests:
+  # Test that modifies data and restores
+  - name: modify_and_restore
+    serial: true
+    setup:
+      # Modify the data
+      - sql:
+          database: default
+          statements:
+            - "UPDATE users SET active = 0 WHERE name = 'alice'"
+            - "DELETE FROM users WHERE name = 'bob'"
+    run:
+      cmd: echo
+      args: ["Data modified"]
+    expect:
+      exit: 0
+      sql:
+        # Verify modifications took effect
+        - row_count:
+            table: users
+            equals: 1
+        - query: "SELECT active FROM users WHERE name = 'alice'"
+          returns: "0"
+    teardown:
+      # Restore to baseline after test
+      - db_restore:
+          database: default
+          name: baseline
+
+  # Verify baseline was restored
+  - name: verify_baseline_restored
+    serial: true
+    run:
+      cmd: echo
+      args: ["Checking baseline state"]
+    expect:
+      exit: 0
+      sql:
+        - row_count:
+            table: users
+            equals: 2
+        - query: "SELECT active FROM users WHERE name = 'alice'"
+          returns: "1"
+
+  # Multi-step workflow with intermediate snapshots
+  - name: multi_snapshot_workflow
+    serial: true
+    steps:
+      - name: add_user_and_snapshot
+        setup:
+          - sql:
+              database: default
+              statements:
+                - "INSERT INTO users (name, active) VALUES ('charlie', 1)"
+          - db_snapshot:
+              database: default
+              name: with_charlie
+        run:
+          cmd: echo
+          args: ["Added charlie"]
+        expect:
+          exit: 0
+          sql:
+            - row_count:
+                table: users
+                equals: 3
+
+      - name: deactivate_all
+        setup:
+          - sql:
+              database: default
+              statements:
+                - "UPDATE users SET active = 0"
+        run:
+          cmd: echo
+          args: ["Deactivated all users"]
+        expect:
+          exit: 0
+          sql:
+            - query: "SELECT COUNT(*) FROM users WHERE active = 1"
+              returns: "0"
+
+      - name: restore_with_charlie
+        setup:
+          - db_restore:
+              database: default
+              name: with_charlie
+        run:
+          cmd: echo
+          args: ["Restored to with_charlie snapshot"]
+        expect:
+          exit: 0
+          sql:
+            # All users should be active again
+            - query: "SELECT COUNT(*) FROM users WHERE active = 1"
+              returns: "3"
+
+      - name: restore_to_baseline
+        setup:
+          - db_restore:
+              database: default
+              name: baseline
+        run:
+          cmd: echo
+          args: ["Restored to baseline"]
+        expect:
+          exit: 0
+          sql:
+            # Back to original 2 users
+            - row_count:
+                table: users
+                equals: 2
+
+teardown:
+  - sql:
+      database: default
+      statements:
+        - "DROP TABLE IF EXISTS users"

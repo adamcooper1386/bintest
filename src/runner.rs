@@ -1396,6 +1396,18 @@ fn run_setup_step(
         run_sql_file(sql_file, ctx, db_manager)?;
     }
 
+    if let Some(snapshot) = &step.db_snapshot {
+        db_manager
+            .create_snapshot(&snapshot.database, &snapshot.name)
+            .map_err(|e| format!("Failed to create snapshot '{}': {e}", snapshot.name))?;
+    }
+
+    if let Some(restore) = &step.db_restore {
+        db_manager
+            .restore_snapshot(&restore.database, &restore.name)
+            .map_err(|e| format!("Failed to restore snapshot '{}': {e}", restore.name))?;
+    }
+
     Ok(())
 }
 
@@ -1501,6 +1513,12 @@ fn run_teardown_step(
             },
         };
         run_sql_statements(&sql_with_continue, db_manager)?;
+    }
+
+    if let Some(restore) = &step.db_restore {
+        db_manager
+            .restore_snapshot(&restore.database, &restore.name)
+            .map_err(|e| format!("Failed to restore snapshot '{}': {e}", restore.name))?;
     }
 
     Ok(())

@@ -206,6 +206,14 @@ pub struct SetupStep {
     /// Execute SQL from a file.
     #[serde(default)]
     pub sql_file: Option<SqlFile>,
+
+    /// Save database state to a named snapshot.
+    #[serde(default)]
+    pub db_snapshot: Option<DbSnapshot>,
+
+    /// Restore database state from a named snapshot.
+    #[serde(default)]
+    pub db_restore: Option<DbRestore>,
 }
 
 /// A teardown step executed after tests.
@@ -229,6 +237,10 @@ pub struct TeardownStep {
     /// Execute SQL statements.
     #[serde(default)]
     pub sql: Option<SqlStatements>,
+
+    /// Restore database state from a named snapshot.
+    #[serde(default)]
+    pub db_restore: Option<DbRestore>,
 }
 
 /// Write a file with specific contents.
@@ -300,6 +312,33 @@ pub enum SqlOnError {
     Fail,
     /// Continue executing remaining statements on error.
     Continue,
+}
+
+/// Save database state to a named snapshot.
+///
+/// Snapshots are stored in memory and can be restored later within the same file.
+/// Currently only supported for SQLite databases.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DbSnapshot {
+    /// Database connection name (defaults to "default").
+    #[serde(default = "default_database_name")]
+    pub database: String,
+
+    /// Name for this snapshot (used to restore later).
+    pub name: String,
+}
+
+/// Restore database state from a named snapshot.
+///
+/// The snapshot must have been created earlier in the same file using `db_snapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DbRestore {
+    /// Database connection name (defaults to "default").
+    #[serde(default = "default_database_name")]
+    pub database: String,
+
+    /// Name of the snapshot to restore.
+    pub name: String,
 }
 
 /// A command to run (used in setup/teardown).
