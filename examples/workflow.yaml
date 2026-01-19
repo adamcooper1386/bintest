@@ -1,0 +1,193 @@
+# Multi-step workflow with SQL assertions
+#
+# This example demonstrates the primary use case for multi-step tests:
+# verifying database state changes across a sequence of commands.
+#
+# Use cases: database migrations, data loaders, ETL pipelines, CLI tools
+# that modify external state.
+
+version: 1
+
+databases:
+  default:
+    driver: sqlite
+    url: "sqlite::memory:"
+
+setup:
+  # Create the schema that our "migration tool" will work with
+  - sql:
+      database: default
+      statements:
+        - |
+          CREATE TABLE _migrations (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT DEFAULT CURRENT_TIMESTAMP
+          )
+
+tests:
+  # Simulates a migration tool that applies and rolls back migrations
+  - name: migration_workflow
+    steps:
+      - name: apply_users_migration
+        # Simulate running: migrate apply 001_users
+        run:
+          cmd: sh
+          args:
+            - "-c"
+            - |
+              sqlite3 :memory: "SELECT 1" >/dev/null 2>&1
+              echo "Applied migration: 001_users"
+        setup:
+          - sql:
+              database: default
+              statements:
+                - |
+                  CREATE TABLE users (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT UNIQUE
+                  )
+                - |
+                  INSERT INTO _migrations (name) VALUES ('001_users')
+        expect:
+          exit: 0
+          stdout:
+            contains: "Applied migration"
+          sql:
+            - table_exists: users
+            - row_count:
+                table: _migrations
+                equals: 1
+
+      - name: apply_posts_migration
+        # Simulate running: migrate apply 002_posts
+        run:
+          cmd: sh
+          args:
+            - "-c"
+            - "echo 'Applied migration: 002_posts'"
+        setup:
+          - sql:
+              database: default
+              statements:
+                - |
+                  CREATE TABLE posts (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id),
+                    title TEXT NOT NULL,
+                    content TEXT
+                  )
+                - |
+                  INSERT INTO _migrations (name) VALUES ('002_posts')
+        expect:
+          exit: 0
+          sql:
+            - table_exists: users
+            - table_exists: posts
+            - row_count:
+                table: _migrations
+                equals: 2
+
+      - name: rollback_posts_migration
+        # Simulate running: migrate rollback
+        run:
+          cmd: sh
+          args:
+            - "-c"
+            - "echo 'Rolled back migration: 002_posts'"
+        setup:
+          - sql:
+              database: default
+              statements:
+                - "DROP TABLE posts"
+                - "DELETE FROM _migrations WHERE name = '002_posts'"
+        expect:
+          exit: 0
+          sql:
+            - table_exists: users
+            - table_not_exists: posts
+            - row_count:
+                table: _migrations
+                equals: 1
+            - query: "SELECT name FROM _migrations"
+              returns: "001_users"
+
+  # Data loading workflow with validation between steps
+  - name: data_import_workflow
+    setup:
+      - sql:
+          database: default
+          statements:
+            - |
+              CREATE TABLE products (
+                id INTEGER PRIMARY KEY,
+                sku TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                price REAL
+              )
+    steps:
+      - name: import_initial_batch
+        run:
+          cmd: sh
+          args:
+            - "-c"
+            - "echo 'Imported 2 products'"
+        setup:
+          - sql:
+              database: default
+              statements:
+                - "INSERT INTO products (sku, name, price) VALUES ('SKU001', 'Widget', 9.99)"
+                - "INSERT INTO products (sku, name, price) VALUES ('SKU002', 'Gadget', 19.99)"
+        expect:
+          exit: 0
+          sql:
+            - row_count:
+                table: products
+                equals: 2
+            - query: "SELECT COUNT(*) FROM products WHERE price > 0"
+              returns: "2"
+
+      - name: update_prices
+        run:
+          cmd: sh
+          args:
+            - "-c"
+            - "echo 'Updated prices'"
+        setup:
+          - sql:
+              database: default
+              statements:
+                - "UPDATE products SET price = price * 1.1"
+        expect:
+          exit: 0
+          sql:
+            - query: "SELECT ROUND(price, 2) FROM products WHERE sku = 'SKU001'"
+              returns: "10.99"
+            - query: "SELECT ROUND(price, 2) FROM products WHERE sku = 'SKU002'"
+              returns: "21.99"
+
+      - name: verify_final_state
+        run:
+          cmd: sh
+          args:
+            - "-c"
+            - "echo 'Verification complete'"
+        expect:
+          exit: 0
+          sql:
+            - row_count:
+                table: products
+                equals: 2
+            - query: "SELECT COUNT(*) FROM products WHERE price > 10"
+              returns: "2"
+
+teardown:
+  - sql:
+      database: default
+      statements:
+        - "DROP TABLE IF EXISTS products"
+        - "DROP TABLE IF EXISTS posts"
+        - "DROP TABLE IF EXISTS users"
+        - "DROP TABLE IF EXISTS _migrations"
+      on_error: continue
