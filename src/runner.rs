@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Default timeout per test in seconds.
@@ -178,12 +179,44 @@ fn run_spec_with_config(spec: &TestSpec, effective: &EffectiveConfig) -> SpecRes
         };
     }
 
-    // Run tests
-    let mut results = Vec::new();
-    for test in &spec.tests {
+    // Partition tests into serial and parallel groups, preserving indices
+    let (serial_tests, parallel_tests): (Vec<_>, Vec<_>) = spec
+        .tests
+        .iter()
+        .enumerate()
+        .partition(|(_, test)| test.serial);
+
+    // Collect results with their indices
+    let mut indexed_results: Vec<(usize, TestResult)> = Vec::with_capacity(spec.tests.len());
+
+    // Run serial tests first, in order
+    for (idx, test) in serial_tests {
         let result = run_test(test, &ctx, file_timeout);
-        results.push(result);
+        indexed_results.push((idx, result));
     }
+
+    // Run parallel tests concurrently
+    if !parallel_tests.is_empty() {
+        let ctx_ref = &ctx;
+        thread::scope(|s| {
+            let handles: Vec<_> = parallel_tests
+                .iter()
+                .map(|(idx, test)| {
+                    let idx = *idx;
+                    s.spawn(move || (idx, run_test(test, ctx_ref, file_timeout)))
+                })
+                .collect();
+
+            for handle in handles {
+                let result = handle.join().expect("Test thread panicked");
+                indexed_results.push(result);
+            }
+        });
+    }
+
+    // Sort by original index to maintain declaration order
+    indexed_results.sort_by_key(|(idx, _)| *idx);
+    let mut results: Vec<TestResult> = indexed_results.into_iter().map(|(_, r)| r).collect();
 
     // Run file-level teardown (always runs)
     if let Err(e) = run_teardown_steps(&spec.teardown, &ctx) {
@@ -1186,10 +1219,13 @@ mod tests {
     #[test]
     fn test_shared_sandbox_between_tests() {
         // First test creates a file, second test reads it
+        // Both must be serial since test2 depends on test1's output
         let mut test1 = make_test("create_file", "sh", vec!["-c", "echo shared > shared.txt"]);
         test1.expect.exit = Some(0);
+        test1.serial = true;
         let mut test2 = make_test("read_file", "cat", vec!["shared.txt"]);
         test2.expect.stdout = Some(OutputMatch::Exact("shared\n".to_string()));
+        test2.serial = true;
         let spec = TestSpec {
             version: 1,
             sandbox: Sandbox::default(),
@@ -1362,5 +1398,173 @@ mod tests {
 
         assert!(!result.tests[0].passed);
         assert!(result.tests[0].failures[0].contains("timed out"));
+    }
+
+    // ==================== Parallel Execution Tests ====================
+
+    #[test]
+    fn test_parallel_tests_run_concurrently() {
+        // Two parallel tests that each sleep 0.3s should complete in ~0.3s, not ~0.6s
+        let mut test1 = make_test("parallel_1", "sleep", vec!["0.3"]);
+        test1.serial = false; // default, but explicit
+        let mut test2 = make_test("parallel_2", "sleep", vec!["0.3"]);
+        test2.serial = false;
+
+        let spec = TestSpec {
+            version: 1,
+            sandbox: Sandbox::default(),
+            timeout: None,
+            setup: vec![],
+            tests: vec![test1, test2],
+            teardown: vec![],
+        };
+
+        let start = std::time::Instant::now();
+        let result = run_spec_standalone(&spec);
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.tests.len(), 2);
+        assert!(result.tests[0].passed);
+        assert!(result.tests[1].passed);
+        // Should complete in less than 0.5s if parallel (0.3s + overhead)
+        // Would be 0.6s+ if sequential
+        assert!(
+            elapsed.as_secs_f64() < 0.5,
+            "Parallel tests took too long: {:.2}s (expected < 0.5s)",
+            elapsed.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn test_serial_tests_run_sequentially() {
+        // Two serial tests that each sleep 0.2s should complete in ~0.4s
+        let mut test1 = make_test("serial_1", "sleep", vec!["0.2"]);
+        test1.serial = true;
+        let mut test2 = make_test("serial_2", "sleep", vec!["0.2"]);
+        test2.serial = true;
+
+        let spec = TestSpec {
+            version: 1,
+            sandbox: Sandbox::default(),
+            timeout: None,
+            setup: vec![],
+            tests: vec![test1, test2],
+            teardown: vec![],
+        };
+
+        let start = std::time::Instant::now();
+        let result = run_spec_standalone(&spec);
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.tests.len(), 2);
+        assert!(result.tests[0].passed);
+        assert!(result.tests[1].passed);
+        // Should take at least 0.4s if sequential
+        assert!(
+            elapsed.as_secs_f64() >= 0.35,
+            "Serial tests completed too fast: {:.2}s (expected >= 0.35s)",
+            elapsed.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn test_serial_tests_run_before_parallel() {
+        // Serial test creates a file, parallel test reads it
+        // This verifies serial tests complete before parallel tests start
+        let mut serial_test = make_test(
+            "serial_create",
+            "sh",
+            vec!["-c", "echo created > marker.txt"],
+        );
+        serial_test.serial = true;
+
+        let mut parallel_test = make_test("parallel_read", "cat", vec!["marker.txt"]);
+        parallel_test.serial = false;
+        parallel_test.expect.stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: Some("created".to_string()),
+            regex: None,
+        }));
+
+        let spec = TestSpec {
+            version: 1,
+            sandbox: Sandbox::default(),
+            timeout: None,
+            setup: vec![],
+            tests: vec![serial_test, parallel_test],
+            teardown: vec![],
+        };
+
+        let result = run_spec_standalone(&spec);
+
+        assert!(
+            result.tests[0].passed,
+            "serial test failed: {:?}",
+            result.tests[0].failures
+        );
+        assert!(
+            result.tests[1].passed,
+            "parallel test failed: {:?}",
+            result.tests[1].failures
+        );
+    }
+
+    #[test]
+    fn test_results_maintain_declaration_order() {
+        // Tests should be reported in declaration order regardless of execution order
+        let mut test1 = make_test("first", "echo", vec!["1"]);
+        test1.serial = false;
+        let mut test2 = make_test("second", "echo", vec!["2"]);
+        test2.serial = true; // Runs first due to serial
+        let mut test3 = make_test("third", "echo", vec!["3"]);
+        test3.serial = false;
+
+        let spec = TestSpec {
+            version: 1,
+            sandbox: Sandbox::default(),
+            timeout: None,
+            setup: vec![],
+            tests: vec![test1, test2, test3],
+            teardown: vec![],
+        };
+
+        let result = run_spec_standalone(&spec);
+
+        assert_eq!(result.tests.len(), 3);
+        assert_eq!(result.tests[0].name, "first");
+        assert_eq!(result.tests[1].name, "second");
+        assert_eq!(result.tests[2].name, "third");
+    }
+
+    #[test]
+    fn test_mixed_serial_parallel_execution() {
+        // Mix of serial and parallel tests
+        let mut s1 = make_test("serial_1", "echo", vec!["s1"]);
+        s1.serial = true;
+        let mut p1 = make_test("parallel_1", "echo", vec!["p1"]);
+        p1.serial = false;
+        let mut s2 = make_test("serial_2", "echo", vec!["s2"]);
+        s2.serial = true;
+        let mut p2 = make_test("parallel_2", "echo", vec!["p2"]);
+        p2.serial = false;
+
+        let spec = TestSpec {
+            version: 1,
+            sandbox: Sandbox::default(),
+            timeout: None,
+            setup: vec![],
+            tests: vec![s1, p1, s2, p2],
+            teardown: vec![],
+        };
+
+        let result = run_spec_standalone(&spec);
+
+        assert_eq!(result.tests.len(), 4);
+        assert!(result.tests.iter().all(|t| t.passed));
+        // Results maintain declaration order
+        assert_eq!(result.tests[0].name, "serial_1");
+        assert_eq!(result.tests[1].name, "parallel_1");
+        assert_eq!(result.tests[2].name, "serial_2");
+        assert_eq!(result.tests[3].name, "parallel_2");
     }
 }
