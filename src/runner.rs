@@ -4,8 +4,10 @@
 
 use crate::database::ConnectionManager;
 use crate::schema::{
-    DatabaseConfig, Expect, FileExpect, OutputMatch, OutputMatchStructured, Run, RunStep, Sandbox,
-    SandboxDir, SetupStep, SuiteConfig, TeardownStep, Test, TestSpec, TreeExpect, WorkDir,
+    DatabaseConfig, DbDriver, Expect, FileExpect, OutputMatch, OutputMatchStructured,
+    RowCountExpect, Run, RunStep, Sandbox, SandboxDir, SetupStep, SqlExpect, SqlOnError,
+    SqlReturns, SqlReturnsStructured, SuiteConfig, TeardownStep, Test, TestSpec, TreeExpect,
+    WorkDir,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -76,7 +78,10 @@ pub fn run_suite_setup(config: &SuiteConfig) -> Result<(), String> {
 
     let ctx = ExecutionContext::new(&Sandbox::default(), config.sandbox_dir.as_ref())
         .map_err(|e| format!("Failed to create suite context: {e}"))?;
-    run_setup_steps(&config.setup, &ctx)
+    let db_manager = ConnectionManager::new(config.databases.clone());
+    let result = run_setup_steps(&config.setup, &ctx, &db_manager);
+    db_manager.close_all();
+    result
 }
 
 /// Run suite-level teardown steps.
@@ -89,7 +94,10 @@ pub fn run_suite_teardown(config: &SuiteConfig) -> Result<(), String> {
 
     let ctx = ExecutionContext::new(&Sandbox::default(), config.sandbox_dir.as_ref())
         .map_err(|e| format!("Failed to create suite context: {e}"))?;
-    run_teardown_steps(&config.teardown, &ctx)
+    let db_manager = ConnectionManager::new(config.databases.clone());
+    let result = run_teardown_steps(&config.teardown, &ctx, &db_manager);
+    db_manager.close_all();
+    result
 }
 
 /// Context for test execution within a sandbox.
@@ -244,10 +252,10 @@ fn run_spec_with_config(
     }
 
     // Create connection manager (connections are lazy, opened on first use)
-    let _db_manager = ConnectionManager::new(merged_databases);
+    let db_manager = ConnectionManager::new(merged_databases);
 
     // Run file-level setup
-    if let Err(e) = run_setup_steps(&spec.setup, &ctx) {
+    if let Err(e) = run_setup_steps(&spec.setup, &ctx, &db_manager) {
         return SpecResult {
             tests: vec![TestResult {
                 name: "<setup>".to_string(),
@@ -283,13 +291,14 @@ fn run_spec_with_config(
 
     // Run serial tests first, in order
     for (idx, test) in serial_tests {
-        let result = run_test(test, &ctx, file_timeout, file_capture_fs_diff);
+        let result = run_test(test, &ctx, &db_manager, file_timeout, file_capture_fs_diff);
         indexed_results.push((idx, result));
     }
 
     // Run parallel tests concurrently
     if !parallel_tests.is_empty() {
         let ctx_ref = &ctx;
+        let db_ref = &db_manager;
         thread::scope(|s| {
             let handles: Vec<_> = parallel_tests
                 .iter()
@@ -298,7 +307,7 @@ fn run_spec_with_config(
                     s.spawn(move || {
                         (
                             idx,
-                            run_test(test, ctx_ref, file_timeout, file_capture_fs_diff),
+                            run_test(test, ctx_ref, db_ref, file_timeout, file_capture_fs_diff),
                         )
                     })
                 })
@@ -316,7 +325,7 @@ fn run_spec_with_config(
     let mut results: Vec<TestResult> = indexed_results.into_iter().map(|(_, r)| r).collect();
 
     // Run file-level teardown (always runs)
-    if let Err(e) = run_teardown_steps(&spec.teardown, &ctx) {
+    if let Err(e) = run_teardown_steps(&spec.teardown, &ctx, &db_manager) {
         results.push(TestResult {
             name: "<teardown>".to_string(),
             passed: false,
@@ -327,12 +336,16 @@ fn run_spec_with_config(
         });
     }
 
+    // Close database connections
+    db_manager.close_all();
+
     SpecResult { tests: results }
 }
 
 fn run_test(
     test: &Test,
     ctx: &ExecutionContext,
+    db_manager: &ConnectionManager,
     file_timeout: Option<u64>,
     file_capture_fs_diff: bool,
 ) -> TestResult {
@@ -344,7 +357,7 @@ fn run_test(
     let capture_fs_diff = test.capture_fs_diff.unwrap_or(file_capture_fs_diff);
 
     // Test-level setup
-    if let Err(e) = run_setup_steps(&test.setup, ctx) {
+    if let Err(e) = run_setup_steps(&test.setup, ctx, db_manager) {
         return TestResult {
             name: test.name.clone(),
             passed: false,
@@ -374,7 +387,7 @@ fn run_test(
 
     for (step_index, step) in test.steps.iter().enumerate() {
         // Step-level setup
-        if let Err(e) = run_setup_steps(&step.setup, ctx) {
+        if let Err(e) = run_setup_steps(&step.setup, ctx, db_manager) {
             let msg = if is_multi_step {
                 format!("Step '{}' [{}] setup failed: {e}", step.name, step_index)
             } else {
@@ -393,7 +406,7 @@ fn run_test(
             Ok(output) => {
                 // Check step assertions
                 let mut step_failures = Vec::new();
-                check_expectations(&step.expect, &output, ctx, &mut step_failures);
+                check_expectations(&step.expect, &output, ctx, db_manager, &mut step_failures);
 
                 if !step_failures.is_empty() {
                     // Prefix failures with step info for multi-step tests
@@ -425,7 +438,7 @@ fn run_test(
         };
 
         // Step-level teardown (always runs for this step, even if assertions failed)
-        if let Err(e) = run_teardown_steps(&step.teardown, ctx) {
+        if let Err(e) = run_teardown_steps(&step.teardown, ctx, db_manager) {
             let msg = if is_multi_step {
                 format!("Step '{}' [{}] teardown failed: {e}", step.name, step_index)
             } else {
@@ -451,7 +464,7 @@ fn run_test(
     });
 
     // Test-level teardown (always runs)
-    if let Err(e) = run_teardown_steps(&test.teardown, ctx) {
+    if let Err(e) = run_teardown_steps(&test.teardown, ctx, db_manager) {
         failures.push(format!("Test teardown failed: {e}"));
     }
 
@@ -574,6 +587,7 @@ fn check_expectations(
     expect: &Expect,
     output: &CommandOutput,
     ctx: &ExecutionContext,
+    db_manager: &ConnectionManager,
     failures: &mut Vec<String>,
 ) {
     // Check signal or exit code (signal takes precedence if specified)
@@ -643,6 +657,11 @@ fn check_expectations(
     // Check tree structure
     if let Some(tree) = &expect.tree {
         check_tree_expect(tree, ctx, failures);
+    }
+
+    // Check SQL assertions
+    for (i, sql_expect) in expect.sql.iter().enumerate() {
+        check_sql_expect(sql_expect, i, db_manager, failures);
     }
 }
 
@@ -828,6 +847,226 @@ fn check_tree_expect(tree_expect: &TreeExpect, ctx: &ExecutionContext, failures:
     }
 }
 
+/// Check a SQL assertion.
+fn check_sql_expect(
+    sql_expect: &SqlExpect,
+    index: usize,
+    db_manager: &ConnectionManager,
+    failures: &mut Vec<String>,
+) {
+    let db_name = &sql_expect.database;
+    let prefix = format!("sql[{index}]");
+
+    // Handle table_exists shorthand
+    if let Some(table) = &sql_expect.table_exists {
+        let query = table_exists_query(db_manager, db_name, table);
+        match db_manager.execute(db_name, &query) {
+            Ok(result) => {
+                // Result should be non-empty or truthy for table existing
+                let exists = !result.is_empty()
+                    && result != "0"
+                    && result.to_lowercase() != "false"
+                    && result.to_lowercase() != "f";
+                if !exists {
+                    failures.push(format!("{prefix}: table '{}' does not exist", table));
+                }
+            }
+            Err(e) => {
+                failures.push(format!("{prefix}: failed to check table existence: {e}"));
+            }
+        }
+        return;
+    }
+
+    // Handle table_not_exists shorthand
+    if let Some(table) = &sql_expect.table_not_exists {
+        let query = table_exists_query(db_manager, db_name, table);
+        match db_manager.execute(db_name, &query) {
+            Ok(result) => {
+                let exists = !result.is_empty()
+                    && result != "0"
+                    && result.to_lowercase() != "false"
+                    && result.to_lowercase() != "f";
+                if exists {
+                    failures.push(format!("{prefix}: table '{}' exists but should not", table));
+                }
+            }
+            Err(_) => {
+                // Query failure likely means table doesn't exist, which is what we want
+            }
+        }
+        return;
+    }
+
+    // Handle row_count shorthand
+    if let Some(row_count) = &sql_expect.row_count {
+        check_row_count(row_count, db_name, &prefix, db_manager, failures);
+        return;
+    }
+
+    // Handle raw query assertions
+    if let Some(query) = &sql_expect.query {
+        match db_manager.execute(db_name, query) {
+            Ok(result) => {
+                // Check returns_empty
+                if let Some(true) = sql_expect.returns_empty {
+                    if !result.is_empty() {
+                        failures.push(format!(
+                            "{prefix}: expected empty result\n  Query: {query}\n  Got: {result:?}"
+                        ));
+                    }
+                    return;
+                }
+
+                // Check returns
+                if let Some(returns) = &sql_expect.returns
+                    && let Err(e) = check_sql_returns(&prefix, query, &result, returns)
+                {
+                    failures.push(e);
+                }
+            }
+            Err(e) => {
+                failures.push(format!(
+                    "{prefix}: query failed\n  Query: {query}\n  Error: {e}"
+                ));
+            }
+        }
+    }
+}
+
+/// Generate a table existence check query appropriate for the database driver.
+fn table_exists_query(db_manager: &ConnectionManager, db_name: &str, table: &str) -> String {
+    // Get driver from config if available
+    let driver = db_manager.get_driver(db_name).unwrap_or(DbDriver::Postgres);
+
+    match driver {
+        DbDriver::Postgres => {
+            format!(
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{table}')"
+            )
+        }
+        DbDriver::Sqlite => {
+            format!("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'")
+        }
+    }
+}
+
+/// Check row count assertion.
+fn check_row_count(
+    row_count: &RowCountExpect,
+    db_name: &str,
+    prefix: &str,
+    db_manager: &ConnectionManager,
+    failures: &mut Vec<String>,
+) {
+    let table = &row_count.table;
+    let query = format!("SELECT COUNT(*) FROM {table}");
+
+    match db_manager.execute(db_name, &query) {
+        Ok(result) => {
+            let count: u64 = match result.trim().parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    failures.push(format!(
+                        "{prefix}: failed to parse row count as number: {result:?}"
+                    ));
+                    return;
+                }
+            };
+
+            if let Some(expected) = row_count.equals
+                && count != expected
+            {
+                failures.push(format!(
+                    "{prefix}: row_count for '{}': expected {}, got {}",
+                    table, expected, count
+                ));
+            }
+
+            if let Some(min) = row_count.greater_than
+                && count <= min
+            {
+                failures.push(format!(
+                    "{prefix}: row_count for '{}': expected > {}, got {}",
+                    table, min, count
+                ));
+            }
+
+            if let Some(max) = row_count.less_than
+                && count >= max
+            {
+                failures.push(format!(
+                    "{prefix}: row_count for '{}': expected < {}, got {}",
+                    table, max, count
+                ));
+            }
+        }
+        Err(e) => {
+            failures.push(format!(
+                "{prefix}: failed to count rows in '{}': {}",
+                table, e
+            ));
+        }
+    }
+}
+
+/// Check SQL query result against expected returns.
+fn check_sql_returns(
+    prefix: &str,
+    query: &str,
+    actual: &str,
+    returns: &SqlReturns,
+) -> Result<(), String> {
+    match returns {
+        SqlReturns::Exact(expected) => {
+            if actual != expected {
+                Err(format!(
+                    "{prefix}: expected exact match\n  Query: {query}\n  Expected: {expected:?}\n  Got: {actual:?}"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        SqlReturns::Structured(s) => check_sql_returns_structured(prefix, query, actual, s),
+    }
+}
+
+/// Check SQL query result against structured match.
+fn check_sql_returns_structured(
+    prefix: &str,
+    query: &str,
+    actual: &str,
+    matcher: &SqlReturnsStructured,
+) -> Result<(), String> {
+    if let Some(expected) = &matcher.equals
+        && actual != expected
+    {
+        return Err(format!(
+            "{prefix}: expected exact match\n  Query: {query}\n  Expected: {expected:?}\n  Got: {actual:?}"
+        ));
+    }
+
+    if let Some(substring) = &matcher.contains
+        && !actual.contains(substring)
+    {
+        return Err(format!(
+            "{prefix}: expected to contain {substring:?}\n  Query: {query}\n  Got: {actual:?}"
+        ));
+    }
+
+    if let Some(pattern) = &matcher.regex {
+        let re = regex::Regex::new(pattern)
+            .map_err(|e| format!("{prefix}: invalid regex {pattern:?}: {e}"))?;
+        if !re.is_match(actual) {
+            return Err(format!(
+                "{prefix}: expected to match regex {pattern:?}\n  Query: {query}\n  Got: {actual:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Recursively copy a directory and all its contents.
 fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
@@ -943,14 +1182,22 @@ fn compute_fs_diff(
     }
 }
 
-fn run_setup_steps(steps: &[SetupStep], ctx: &ExecutionContext) -> Result<(), String> {
+fn run_setup_steps(
+    steps: &[SetupStep],
+    ctx: &ExecutionContext,
+    db_manager: &ConnectionManager,
+) -> Result<(), String> {
     for step in steps {
-        run_setup_step(step, ctx)?;
+        run_setup_step(step, ctx, db_manager)?;
     }
     Ok(())
 }
 
-fn run_setup_step(step: &SetupStep, ctx: &ExecutionContext) -> Result<(), String> {
+fn run_setup_step(
+    step: &SetupStep,
+    ctx: &ExecutionContext,
+    db_manager: &ConnectionManager,
+) -> Result<(), String> {
     if let Some(write_file) = &step.write_file {
         let path = ctx.resolve_path(&write_file.path);
         if let Some(parent) = path.parent() {
@@ -999,13 +1246,71 @@ fn run_setup_step(step: &SetupStep, ctx: &ExecutionContext) -> Result<(), String
         run_simple_command(run, ctx)?;
     }
 
+    if let Some(sql) = &step.sql {
+        run_sql_statements(sql, db_manager)?;
+    }
+
+    if let Some(sql_file) = &step.sql_file {
+        run_sql_file(sql_file, ctx, db_manager)?;
+    }
+
     Ok(())
 }
 
-fn run_teardown_steps(steps: &[TeardownStep], ctx: &ExecutionContext) -> Result<(), String> {
+/// Execute SQL statements from a SqlStatements config.
+fn run_sql_statements(
+    sql: &crate::schema::SqlStatements,
+    db_manager: &ConnectionManager,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    for statement in &sql.statements {
+        if let Err(e) = db_manager.execute(&sql.database, statement) {
+            let err_msg = format!("SQL error: {e}");
+            if sql.on_error == SqlOnError::Fail {
+                return Err(err_msg);
+            }
+            errors.push(err_msg);
+        }
+    }
+
+    if !errors.is_empty() && sql.on_error == SqlOnError::Fail {
+        return Err(errors.join("; "));
+    }
+
+    Ok(())
+}
+
+/// Execute SQL from a file.
+fn run_sql_file(
+    sql_file: &crate::schema::SqlFile,
+    ctx: &ExecutionContext,
+    db_manager: &ConnectionManager,
+) -> Result<(), String> {
+    let path = ctx.resolve_path(&sql_file.path);
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read SQL file {}: {e}", sql_file.path.display()))?;
+
+    // Execute the file contents as a single statement
+    // Note: For multiple statements, users should use sql.statements instead
+    if let Err(e) = db_manager.execute(&sql_file.database, &contents) {
+        let err_msg = format!("SQL file {} failed: {e}", sql_file.path.display());
+        if sql_file.on_error == SqlOnError::Fail {
+            return Err(err_msg);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_teardown_steps(
+    steps: &[TeardownStep],
+    ctx: &ExecutionContext,
+    db_manager: &ConnectionManager,
+) -> Result<(), String> {
     let mut errors = Vec::new();
     for step in steps {
-        if let Err(e) = run_teardown_step(step, ctx) {
+        if let Err(e) = run_teardown_step(step, ctx, db_manager) {
             errors.push(e);
         }
     }
@@ -1016,7 +1321,11 @@ fn run_teardown_steps(steps: &[TeardownStep], ctx: &ExecutionContext) -> Result<
     }
 }
 
-fn run_teardown_step(step: &TeardownStep, ctx: &ExecutionContext) -> Result<(), String> {
+fn run_teardown_step(
+    step: &TeardownStep,
+    ctx: &ExecutionContext,
+    db_manager: &ConnectionManager,
+) -> Result<(), String> {
     if let Some(dir_path) = &step.remove_dir {
         let path = ctx.resolve_path(dir_path);
         if path.exists() {
@@ -1035,6 +1344,21 @@ fn run_teardown_step(step: &TeardownStep, ctx: &ExecutionContext) -> Result<(), 
 
     if let Some(run) = &step.run {
         run_simple_command(run, ctx)?;
+    }
+
+    if let Some(sql) = &step.sql {
+        // For teardown, we use the same function but always continue on error
+        // since we want to try all statements
+        let sql_with_continue = crate::schema::SqlStatements {
+            database: sql.database.clone(),
+            statements: sql.statements.clone(),
+            on_error: if sql.on_error == SqlOnError::Fail {
+                SqlOnError::Fail
+            } else {
+                SqlOnError::Continue
+            },
+        };
+        run_sql_statements(&sql_with_continue, db_manager)?;
     }
 
     Ok(())
@@ -1432,6 +1756,7 @@ mod tests {
             copy_file: None,
             copy_dir: None,
             run: None,
+            ..Default::default()
         }];
         let result = run_spec_standalone(&spec);
 
@@ -1453,6 +1778,7 @@ mod tests {
             copy_file: None,
             copy_dir: None,
             run: None,
+            ..Default::default()
         }];
         let result = run_spec_standalone(&spec);
 
@@ -1476,6 +1802,7 @@ mod tests {
             copy_file: None,
             copy_dir: None,
             run: None,
+            ..Default::default()
         }];
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
@@ -1502,6 +1829,7 @@ mod tests {
                 copy_file: None,
                 copy_dir: None,
                 run: None,
+                ..Default::default()
             },
             SetupStep {
                 write_file: None,
@@ -1512,6 +1840,7 @@ mod tests {
                 }),
                 copy_dir: None,
                 run: None,
+                ..Default::default()
             },
         ];
         let result = run_spec_standalone(&spec);
@@ -1544,6 +1873,7 @@ mod tests {
                     "echo 'setup ran' > created_by_setup.txt".to_string(),
                 ],
             }),
+            ..Default::default()
         }];
         let result = run_spec_standalone(&spec);
 
@@ -1576,6 +1906,7 @@ mod tests {
                 copy_file: None,
                 copy_dir: None,
                 run: None,
+                ..Default::default()
             },
             SetupStep {
                 write_file: Some(WriteFile {
@@ -1586,6 +1917,7 @@ mod tests {
                 copy_file: None,
                 copy_dir: None,
                 run: None,
+                ..Default::default()
             },
             SetupStep {
                 write_file: Some(WriteFile {
@@ -1596,6 +1928,7 @@ mod tests {
                 copy_file: None,
                 copy_dir: None,
                 run: None,
+                ..Default::default()
             },
             SetupStep {
                 write_file: None,
@@ -1606,6 +1939,7 @@ mod tests {
                     to: PathBuf::from("dest"),
                 }),
                 run: None,
+                ..Default::default()
             },
         ];
         let result = run_spec_standalone(&spec);
@@ -1630,6 +1964,7 @@ mod tests {
             remove_dir: None,
             remove_file: Some(PathBuf::from("to_remove.txt")),
             run: None,
+            ..Default::default()
         }];
         let result = run_spec_standalone(&spec);
 
@@ -1897,6 +2232,7 @@ mod tests {
             copy_file: None,
             copy_dir: None,
             run: None,
+            ..Default::default()
         }];
         let result = run_spec_standalone(&spec);
 
@@ -2269,6 +2605,7 @@ mod tests {
             copy_file: None,
             copy_dir: None,
             run: None,
+            ..Default::default()
         }];
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);
@@ -2298,6 +2635,7 @@ mod tests {
             copy_file: None,
             copy_dir: None,
             run: None,
+            ..Default::default()
         }];
         let spec = make_spec(test);
         let result = run_spec_standalone(&spec);

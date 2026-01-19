@@ -393,6 +393,11 @@ impl ConnectionManager {
         !self.configs.is_empty()
     }
 
+    /// Get the driver type for a named database.
+    pub fn get_driver(&self, name: &str) -> Option<DbDriver> {
+        self.configs.get(name).map(|c| c.driver)
+    }
+
     /// Close all connections.
     pub fn close_all(&self) {
         if let Ok(mut connections) = self.connections.lock() {

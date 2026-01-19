@@ -1,0 +1,124 @@
+version: 1
+
+# SQL assertions example
+# This demonstrates how to verify database state after command execution.
+# Requires a database configuration (shown in bintest.yaml or inline).
+
+# Example database configuration (typically in bintest.yaml):
+databases:
+  default:
+    driver: sqlite
+    url: "sqlite::memory:"
+
+sandbox:
+  workdir: temp
+
+setup:
+  # Create a test table using SQL
+  - sql:
+      database: default
+      statements:
+        - "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)"
+        - "INSERT INTO users (name, email) VALUES ('alice', 'alice@example.com')"
+        - "INSERT INTO users (name, email) VALUES ('bob', 'bob@example.com')"
+
+tests:
+  # Test SQL query with exact match
+  # Note: Tests that depend on exact row counts should run serially
+  - name: query_returns_exact
+    serial: true
+    run:
+      cmd: echo
+      args: ["User count check"]
+    expect:
+      sql:
+        - query: "SELECT COUNT(*) FROM users"
+          returns: "2"
+
+  # Test SQL query with structured matching
+  - name: query_returns_contains
+    run:
+      cmd: echo
+      args: ["User search"]
+    expect:
+      sql:
+        - query: "SELECT name FROM users WHERE email LIKE '%alice%'"
+          returns:
+            contains: "alice"
+
+  # Test SQL query with regex matching
+  - name: query_returns_regex
+    run:
+      cmd: echo
+      args: ["Email pattern check"]
+    expect:
+      sql:
+        - query: "SELECT email FROM users ORDER BY id LIMIT 1"
+          returns:
+            regex: "^\\w+@example\\.com$"
+
+  # Test table existence
+  - name: table_exists_check
+    run:
+      cmd: echo
+      args: ["Schema validation"]
+    expect:
+      sql:
+        - table_exists: users
+        - table_not_exists: nonexistent_table
+
+  # Test row count assertions
+  - name: row_count_check
+    serial: true
+    run:
+      cmd: echo
+      args: ["Row count validation"]
+    expect:
+      sql:
+        - row_count:
+            table: users
+            equals: 2
+        - row_count:
+            table: users
+            greater_than: 1
+        - row_count:
+            table: users
+            less_than: 10
+
+  # Test returns_empty assertion
+  - name: query_returns_empty
+    run:
+      cmd: echo
+      args: ["No results expected"]
+    expect:
+      sql:
+        - query: "SELECT * FROM users WHERE name = 'nonexistent'"
+          returns_empty: true
+
+  # Test with setup SQL in test (must be serial since it modifies state)
+  - name: test_with_sql_setup
+    serial: true
+    setup:
+      - sql:
+          database: default
+          statements:
+            - "INSERT INTO users (name, email) VALUES ('charlie', 'charlie@example.com')"
+    run:
+      cmd: echo
+      args: ["After insert"]
+    expect:
+      sql:
+        - row_count:
+            table: users
+            equals: 3
+    teardown:
+      - sql:
+          database: default
+          statements:
+            - "DELETE FROM users WHERE name = 'charlie'"
+
+teardown:
+  - sql:
+      database: default
+      statements:
+        - "DROP TABLE IF EXISTS users"

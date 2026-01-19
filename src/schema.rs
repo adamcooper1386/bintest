@@ -176,7 +176,7 @@ impl From<WorkDir> for Option<String> {
 /// A setup step executed before tests.
 ///
 /// Each step is a single-key map where the key determines the action.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SetupStep {
     /// Write a file with the given contents.
@@ -198,12 +198,20 @@ pub struct SetupStep {
     /// Run an arbitrary command.
     #[serde(default)]
     pub run: Option<RunStep>,
+
+    /// Execute SQL statements.
+    #[serde(default)]
+    pub sql: Option<SqlStatements>,
+
+    /// Execute SQL from a file.
+    #[serde(default)]
+    pub sql_file: Option<SqlFile>,
 }
 
 /// A teardown step executed after tests.
 ///
 /// Each step is a single-key map where the key determines the action.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct TeardownStep {
     /// Remove a directory.
@@ -217,6 +225,10 @@ pub struct TeardownStep {
     /// Run an arbitrary command.
     #[serde(default)]
     pub run: Option<RunStep>,
+
+    /// Execute SQL statements.
+    #[serde(default)]
+    pub sql: Option<SqlStatements>,
 }
 
 /// Write a file with specific contents.
@@ -247,6 +259,47 @@ pub struct CopyDir {
 
     /// Destination directory path.
     pub to: PathBuf,
+}
+
+/// SQL statements to execute.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SqlStatements {
+    /// Database connection name (defaults to "default").
+    #[serde(default = "default_database_name")]
+    pub database: String,
+
+    /// SQL statements to execute in order.
+    pub statements: Vec<String>,
+
+    /// Error handling: "fail" (default) or "continue".
+    #[serde(default)]
+    pub on_error: SqlOnError,
+}
+
+/// SQL file to execute.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SqlFile {
+    /// Database connection name (defaults to "default").
+    #[serde(default = "default_database_name")]
+    pub database: String,
+
+    /// Path to the SQL file (relative to sandbox).
+    pub path: PathBuf,
+
+    /// Error handling: "fail" (default) or "continue".
+    #[serde(default)]
+    pub on_error: SqlOnError,
+}
+
+/// Error handling strategy for SQL execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SqlOnError {
+    /// Stop execution on first error (default).
+    #[default]
+    Fail,
+    /// Continue executing remaining statements on error.
+    Continue,
 }
 
 /// A command to run (used in setup/teardown).
@@ -479,6 +532,10 @@ pub struct Expect {
     /// Expected directory tree structure.
     #[serde(default)]
     pub tree: Option<TreeExpect>,
+
+    /// Expected database state (SQL assertions).
+    #[serde(default)]
+    pub sql: Vec<SqlExpect>,
 }
 
 /// Matching rules for stdout/stderr.
@@ -552,6 +609,95 @@ pub struct TreeEntry {
     /// Expected file contents (only for files, not directories).
     #[serde(default)]
     pub contents: Option<OutputMatch>,
+}
+
+// ============================================================================
+// SQL Assertion Types
+// ============================================================================
+
+/// A SQL assertion to verify database state.
+///
+/// Supports multiple assertion types through mutually exclusive fields.
+/// Only one type of assertion should be specified per `SqlExpect`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SqlExpect {
+    /// Database connection name (defaults to "default").
+    #[serde(default = "default_database_name")]
+    pub database: String,
+
+    /// Raw SQL query to execute.
+    #[serde(default)]
+    pub query: Option<String>,
+
+    /// Expected result from the query.
+    #[serde(default)]
+    pub returns: Option<SqlReturns>,
+
+    /// Assert that the query returns no rows.
+    #[serde(default)]
+    pub returns_empty: Option<bool>,
+
+    /// Shorthand: check if a table exists.
+    #[serde(default)]
+    pub table_exists: Option<String>,
+
+    /// Shorthand: check if a table does not exist.
+    #[serde(default)]
+    pub table_not_exists: Option<String>,
+
+    /// Shorthand: assert row count for a table.
+    #[serde(default)]
+    pub row_count: Option<RowCountExpect>,
+}
+
+fn default_database_name() -> String {
+    "default".to_string()
+}
+
+/// Expected return value from a SQL query.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum SqlReturns {
+    /// Exact string match (single value or newline-separated for multiple rows).
+    Exact(String),
+
+    /// Structured match with multiple options.
+    Structured(SqlReturnsStructured),
+}
+
+/// Structured SQL result matching.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SqlReturnsStructured {
+    /// Exact string match.
+    #[serde(default)]
+    pub equals: Option<String>,
+
+    /// Substring match.
+    #[serde(default)]
+    pub contains: Option<String>,
+
+    /// Regular expression match.
+    #[serde(default)]
+    pub regex: Option<String>,
+}
+
+/// Row count assertion for a table.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RowCountExpect {
+    /// Table name to count rows from.
+    pub table: String,
+
+    /// Exact row count expected.
+    #[serde(default)]
+    pub equals: Option<u64>,
+
+    /// Minimum row count (exclusive).
+    #[serde(default)]
+    pub greater_than: Option<u64>,
+
+    /// Maximum row count (exclusive).
+    #[serde(default)]
+    pub less_than: Option<u64>,
 }
 
 // ============================================================================
