@@ -15,10 +15,13 @@ Before working on this project, read these files in order:
 ## Development Workflow
 
 1. **Read** - Study the product docs (see above)
-2. **Check** - Does the task align with prd.md?
-3. **Implement** - Write code that satisfies the PRD
-4. **Verify** - Run `cargo check` and `cargo test` after changes
-5. **Commit** - Only after all checks pass with no warnings
+2. **History** - Review recent git history
+3. **Check** - Does the task align with prd.md?
+4. **Implement** - Write code that satisfies the PRD
+5. **Verify** - Run `cargo check` and `cargo test` after changes
+6. **Examples** - Add examples of implemented feature to examples directory
+7. **Verify Examples** - Verify that all examples still pass
+8. **Commit** - Only after all checks pass with no warnings IMPORTANT! CHANGES MUST BE COMMITED AT THE END OF THE WORKFLOW. THE HUMAN REVIEWS COMMITS.
 
 If requirements are unclear or missing, update prd.md first.
 
