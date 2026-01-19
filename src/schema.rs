@@ -39,6 +39,12 @@ pub struct SuiteConfig {
     #[serde(default)]
     pub capture_fs_diff: bool,
 
+    /// Directory for test sandboxes. If set, sandboxes are created here instead of system temp.
+    /// Use "local" for `.bintest/<timestamp>/`, or specify a custom path.
+    /// When not set, uses system temp directory (auto-deleted after tests).
+    #[serde(default)]
+    pub sandbox_dir: Option<SandboxDir>,
+
     /// Setup steps run before the entire suite.
     #[serde(default)]
     pub setup: Vec<SetupStep>,
@@ -50,6 +56,35 @@ pub struct SuiteConfig {
 
 fn default_version() -> u32 {
     1
+}
+
+/// Directory configuration for test sandboxes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(from = "String", into = "String")]
+pub enum SandboxDir {
+    /// Use `.bintest/<timestamp>/` in the test root directory.
+    Local,
+    /// Use a specific path for sandboxes.
+    Path(PathBuf),
+}
+
+impl From<String> for SandboxDir {
+    fn from(s: String) -> Self {
+        if s == "local" {
+            SandboxDir::Local
+        } else {
+            SandboxDir::Path(PathBuf::from(s))
+        }
+    }
+}
+
+impl From<SandboxDir> for String {
+    fn from(dir: SandboxDir) -> String {
+        match dir {
+            SandboxDir::Local => "local".to_string(),
+            SandboxDir::Path(p) => p.display().to_string(),
+        }
+    }
 }
 
 /// Root document for a test specification file.
@@ -100,13 +135,32 @@ pub struct Sandbox {
 
 /// Working directory configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
+#[serde(from = "Option<String>", into = "Option<String>")]
 pub enum WorkDir {
     /// Use a temporary directory (deleted after tests).
     #[default]
     Temp,
     /// Use a specific path.
     Path(PathBuf),
+}
+
+impl From<Option<String>> for WorkDir {
+    fn from(s: Option<String>) -> Self {
+        match s {
+            None => WorkDir::Temp,
+            Some(s) if s == "temp" => WorkDir::Temp,
+            Some(path) => WorkDir::Path(PathBuf::from(path)),
+        }
+    }
+}
+
+impl From<WorkDir> for Option<String> {
+    fn from(w: WorkDir) -> Option<String> {
+        match w {
+            WorkDir::Temp => Some("temp".to_string()),
+            WorkDir::Path(p) => Some(p.display().to_string()),
+        }
+    }
 }
 
 /// A setup step executed before tests.

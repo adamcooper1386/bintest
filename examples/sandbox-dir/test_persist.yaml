@@ -1,0 +1,35 @@
+# Tests with persistent sandbox
+# Files created here will be available in .bintest/<timestamp>/ after the run
+# This is useful for debugging test failures
+
+version: 1
+
+sandbox:
+  workdir: temp  # This will use .bintest/<timestamp>/ due to suite config
+
+tests:
+  - name: create_debug_artifacts
+    description: Creates files that persist for debugging
+    run:
+      cmd: sh
+      args: ["-c", "echo 'debug output' > debug.log && mkdir -p artifacts && echo 'test data' > artifacts/data.txt"]
+    expect:
+      exit: 0
+      files:
+        - path: debug.log
+          exists: true
+        - path: artifacts/data.txt
+          contents:
+            contains: "test data"
+
+  - name: generate_report
+    description: Creates a report file for later inspection
+    run:
+      cmd: sh
+      args: ["-c", "date > report.txt && echo 'Test run complete' >> report.txt"]
+    expect:
+      exit: 0
+      files:
+        - path: report.txt
+          contents:
+            contains: "Test run complete"

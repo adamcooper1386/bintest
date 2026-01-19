@@ -3,8 +3,8 @@
 //! Runs test specs in isolated sandboxes and captures results.
 
 use crate::schema::{
-    Expect, FileExpect, OutputMatch, OutputMatchStructured, Run, RunStep, Sandbox, SetupStep,
-    SuiteConfig, TeardownStep, Test, TestSpec, TreeExpect, WorkDir,
+    Expect, FileExpect, OutputMatch, OutputMatchStructured, Run, RunStep, Sandbox, SandboxDir,
+    SetupStep, SuiteConfig, TeardownStep, Test, TestSpec, TreeExpect, WorkDir,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -61,7 +61,7 @@ pub fn run_suite_setup(config: &SuiteConfig) -> Result<(), String> {
         return Ok(());
     }
 
-    let ctx = ExecutionContext::new(&Sandbox::default())
+    let ctx = ExecutionContext::new(&Sandbox::default(), config.sandbox_dir.as_ref())
         .map_err(|e| format!("Failed to create suite context: {e}"))?;
     run_setup_steps(&config.setup, &ctx)
 }
@@ -74,7 +74,7 @@ pub fn run_suite_teardown(config: &SuiteConfig) -> Result<(), String> {
         return Ok(());
     }
 
-    let ctx = ExecutionContext::new(&Sandbox::default())
+    let ctx = ExecutionContext::new(&Sandbox::default(), config.sandbox_dir.as_ref())
         .map_err(|e| format!("Failed to create suite context: {e}"))?;
     run_teardown_steps(&config.teardown, &ctx)
 }
@@ -88,14 +88,29 @@ struct ExecutionContext {
 }
 
 impl ExecutionContext {
-    fn new(sandbox: &Sandbox) -> std::io::Result<Self> {
-        let (sandbox_dir, temp_dir) = match &sandbox.workdir {
-            WorkDir::Temp => {
+    fn new(sandbox: &Sandbox, suite_sandbox_dir: Option<&SandboxDir>) -> std::io::Result<Self> {
+        let (sandbox_dir, temp_dir) = match (&sandbox.workdir, suite_sandbox_dir) {
+            // If suite specifies a sandbox_dir and workdir is temp, use the suite's dir
+            (WorkDir::Temp, Some(SandboxDir::Local)) => {
+                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
+                let dir = PathBuf::from(".bintest").join(timestamp.to_string());
+                std::fs::create_dir_all(&dir)?;
+                (dir, None)
+            }
+            (WorkDir::Temp, Some(SandboxDir::Path(p))) => {
+                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
+                let dir = p.join(timestamp.to_string());
+                std::fs::create_dir_all(&dir)?;
+                (dir, None)
+            }
+            // Default temp behavior
+            (WorkDir::Temp, None) => {
                 let temp = tempfile::tempdir()?;
                 let path = temp.path().to_path_buf();
                 (path, Some(temp))
             }
-            WorkDir::Path(p) => {
+            // Explicit path always wins
+            (WorkDir::Path(p), _) => {
                 std::fs::create_dir_all(p)?;
                 (p.clone(), None)
             }
@@ -129,6 +144,8 @@ pub struct EffectiveConfig {
     pub inherit_env: Option<bool>,
     /// Whether to capture filesystem diffs (suite-level default).
     pub capture_fs_diff: bool,
+    /// Directory for test sandboxes (from suite config or CLI).
+    pub sandbox_dir: Option<SandboxDir>,
 }
 
 impl EffectiveConfig {
@@ -140,6 +157,7 @@ impl EffectiveConfig {
                 suite_env: cfg.env.clone(),
                 inherit_env: cfg.inherit_env,
                 capture_fs_diff: cfg.capture_fs_diff,
+                sandbox_dir: cfg.sandbox_dir.clone(),
             },
             None => Self::default(),
         }
@@ -187,7 +205,7 @@ fn run_spec_with_config(
     // Determine file-level capture_fs_diff (file overrides suite)
     let file_capture_fs_diff = spec.capture_fs_diff.unwrap_or(effective.capture_fs_diff);
 
-    let ctx = match ExecutionContext::new(&merged_sandbox) {
+    let ctx = match ExecutionContext::new(&merged_sandbox, effective.sandbox_dir.as_ref()) {
         Ok(ctx) => ctx,
         Err(e) => {
             return SpecResult {
@@ -1691,6 +1709,7 @@ mod tests {
             inherit_env: None,
             serial: false,
             capture_fs_diff: false,
+            sandbox_dir: None,
             setup: vec![],
             teardown: vec![],
         };
@@ -1716,6 +1735,7 @@ mod tests {
             inherit_env: None,
             serial: false,
             capture_fs_diff: false,
+            sandbox_dir: None,
             setup: vec![],
             teardown: vec![],
         };
@@ -1745,6 +1765,7 @@ mod tests {
             inherit_env: None,
             serial: false,
             capture_fs_diff: false,
+            sandbox_dir: None,
             setup: vec![],
             teardown: vec![],
         };
@@ -1774,6 +1795,7 @@ mod tests {
             inherit_env: None,
             serial: false,
             capture_fs_diff: false,
+            sandbox_dir: None,
             setup: vec![],
             teardown: vec![],
         };
@@ -2216,5 +2238,61 @@ mod tests {
             "failures: {:?}",
             result.tests[0].failures
         );
+    }
+
+    #[test]
+    fn test_sandbox_dir_local_creates_bintest_directory() {
+        // Create a temp directory to use as working directory
+        let temp_dir = tempfile::tempdir().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        // Create a suite config with sandbox_dir: local
+        let suite_config = SuiteConfig {
+            version: 1,
+            timeout: None,
+            env: HashMap::new(),
+            inherit_env: None,
+            serial: false,
+            capture_fs_diff: false,
+            sandbox_dir: Some(SandboxDir::Local),
+            setup: vec![],
+            teardown: vec![],
+        };
+
+        // Run a simple test
+        let mut test = make_test("sandbox_test", "sh", vec!["-c", "pwd"]);
+        test.expect.exit = Some(0);
+        let spec = make_spec(test);
+
+        let result = run_spec(&spec, Some(&suite_config));
+
+        // Verify test passed
+        assert!(
+            result.tests[0].passed,
+            "failures: {:?}",
+            result.tests[0].failures
+        );
+
+        // Verify .bintest directory was created
+        let bintest_dir = temp_dir.path().join(".bintest");
+        assert!(
+            bintest_dir.exists(),
+            ".bintest directory should exist at {:?}",
+            bintest_dir
+        );
+
+        // Verify there's a timestamp subdirectory
+        let entries: Vec<_> = std::fs::read_dir(&bintest_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            ".bintest directory should contain timestamp subdirectory"
+        );
+
+        // Restore original directory
+        std::env::set_current_dir(original_dir).unwrap();
     }
 }

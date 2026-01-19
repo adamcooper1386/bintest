@@ -1,0 +1,11 @@
+# Suite configuration with local sandbox directory
+# Test files persist in .bintest/<timestamp>/ for debugging
+
+version: 1
+
+# Use "local" for .bintest/<timestamp>/ directories
+# Or specify a custom path like: sandbox_dir: /tmp/my-tests
+sandbox_dir: local
+
+# Other suite settings
+timeout: 5

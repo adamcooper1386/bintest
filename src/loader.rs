@@ -247,4 +247,44 @@ env:
         let result = load_suite_config(dir.path());
         assert!(matches!(result, Err(LoadError::Yaml(_))));
     }
+
+    #[test]
+    fn load_suite_config_with_sandbox_dir_local() {
+        use crate::schema::SandboxDir;
+
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bintest.yaml"),
+            r#"
+version: 1
+sandbox_dir: local
+"#,
+        )
+        .unwrap();
+
+        let config = load_suite_config(dir.path()).unwrap().unwrap();
+        assert!(matches!(config.sandbox_dir, Some(SandboxDir::Local)));
+    }
+
+    #[test]
+    fn load_suite_config_with_sandbox_dir_path() {
+        use crate::schema::SandboxDir;
+        use std::path::PathBuf;
+
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bintest.yaml"),
+            r#"
+version: 1
+sandbox_dir: /tmp/custom-dir
+"#,
+        )
+        .unwrap();
+
+        let config = load_suite_config(dir.path()).unwrap().unwrap();
+        assert!(matches!(
+            config.sandbox_dir,
+            Some(SandboxDir::Path(p)) if p == PathBuf::from("/tmp/custom-dir")
+        ));
+    }
 }

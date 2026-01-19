@@ -44,6 +44,10 @@ enum Command {
         /// Show verbose output (command details, full diffs)
         #[arg(short, long)]
         verbose: bool,
+        /// Directory for test sandboxes (overrides suite config).
+        /// Use "local" for .bintest/<timestamp>/, or specify a path.
+        #[arg(long)]
+        sandbox_dir: Option<String>,
     },
     /// Validate test specs without running them
     Validate {
@@ -69,6 +73,7 @@ fn main() {
             output,
             filter,
             verbose,
+            sandbox_dir,
         } => {
             // Show filter info in verbose mode
             if verbose && let Some(ref f) = filter {
@@ -83,13 +88,25 @@ fn main() {
             };
 
             // Load suite config if present
-            let suite_config = match loader::load_suite_config(test_root) {
+            let mut suite_config = match loader::load_suite_config(test_root) {
                 Ok(config) => config,
                 Err(e) => {
                     eprintln!("Error loading suite config: {e}");
                     std::process::exit(1);
                 }
             };
+
+            // CLI sandbox_dir overrides suite config
+            if let Some(ref dir) = sandbox_dir {
+                suite_config = Some(suite_config.unwrap_or_default());
+                if let Some(ref mut config) = suite_config {
+                    config.sandbox_dir = Some(if dir == "local" {
+                        schema::SandboxDir::Local
+                    } else {
+                        schema::SandboxDir::Path(PathBuf::from(dir))
+                    });
+                }
+            }
 
             let spec_paths = match loader::find_specs(&path) {
                 Ok(s) => s,
