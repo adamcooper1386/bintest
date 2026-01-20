@@ -17,6 +17,17 @@ pub struct SuiteConfig {
     #[serde(default = "default_version")]
     pub version: u32,
 
+    /// The binary under test.
+    ///
+    /// Path to the executable being tested. Resolved relative to this config file.
+    /// Available as `${BINARY}` in all commands. File-level `binary` overrides this.
+    #[serde(default)]
+    pub binary: Option<String>,
+
+    /// Resolved absolute path to the binary (set by loader, not from YAML).
+    #[serde(skip)]
+    pub resolved_binary: Option<PathBuf>,
+
     /// Default timeout in seconds for all tests (can be overridden at file/test level).
     #[serde(default)]
     pub timeout: Option<u64>,
@@ -97,6 +108,17 @@ impl From<SandboxDir> for String {
 pub struct TestSpec {
     /// Schema version (must match crate major version).
     pub version: u32,
+
+    /// The binary under test.
+    ///
+    /// Path to the executable being tested. Resolved relative to this spec file.
+    /// Available as `${BINARY}` in all commands. Overrides suite-level `binary`.
+    #[serde(default)]
+    pub binary: Option<String>,
+
+    /// Resolved absolute path to the binary (set by loader, not from YAML).
+    #[serde(skip)]
+    pub resolved_binary: Option<PathBuf>,
 
     /// Sandbox configuration for this spec file.
     #[serde(default)]

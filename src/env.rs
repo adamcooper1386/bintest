@@ -1,5 +1,7 @@
 //! Environment variable interpolation utilities.
 
+use std::collections::HashMap;
+
 /// Interpolate environment variables in a string.
 ///
 /// Supports `${VAR}` syntax. Returns an error message if a referenced variable is not set.
@@ -12,6 +14,14 @@
 /// assert_eq!(bintest::env::interpolate_env("prefix_${MY_VAR}_suffix").unwrap(), "prefix_hello_suffix");
 /// ```
 pub fn interpolate_env(s: &str) -> Result<String, String> {
+    interpolate_env_with(s, &HashMap::new())
+}
+
+/// Interpolate environment variables in a string, with additional variables from a map.
+///
+/// First checks the provided map, then falls back to system environment variables.
+/// Supports `${VAR}` syntax. Returns an error message if a referenced variable is not set.
+pub fn interpolate_env_with(s: &str, env: &HashMap<String, String>) -> Result<String, String> {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
 
@@ -28,8 +38,12 @@ pub fn interpolate_env(s: &str) -> Result<String, String> {
                     }
                 }
             }
-            let value = std::env::var(&var_name)
-                .map_err(|_| format!("Environment variable '{var_name}' is not set"))?;
+            // First check provided env map, then system env
+            let value = env
+                .get(&var_name)
+                .cloned()
+                .or_else(|| std::env::var(&var_name).ok())
+                .ok_or_else(|| format!("Environment variable '{var_name}' is not set"))?;
             result.push_str(&value);
         } else {
             result.push(c);

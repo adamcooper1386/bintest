@@ -2,6 +2,7 @@
 //!
 //! Loads and parses test specification files from disk.
 
+use crate::env;
 use crate::schema::{SuiteConfig, TestSpec};
 use std::path::Path;
 
@@ -47,14 +48,47 @@ pub fn load_spec(path: &Path) -> Result<TestSpec, LoadError> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let contents = std::fs::read_to_string(path).map_err(LoadError::Io)?;
 
-    let spec: TestSpec = match ext {
+    let mut spec: TestSpec = match ext {
         "yaml" | "yml" => serde_yaml::from_str(&contents).map_err(LoadError::Yaml)?,
         "toml" => toml::from_str(&contents).map_err(LoadError::Toml)?,
         other => return Err(LoadError::UnsupportedFormat(other.to_string())),
     };
 
     validate_spec(&spec)?;
+
+    // Resolve binary path relative to spec file location
+    if let Some(binary) = &spec.binary {
+        spec.resolved_binary = Some(resolve_binary_path(binary, path)?);
+    }
+
     Ok(spec)
+}
+
+/// Resolve a binary path relative to a config file location.
+///
+/// If the binary path contains `${VAR}` references, they are interpolated first.
+/// The resulting path is resolved relative to the config file's directory,
+/// then canonicalized to an absolute path.
+fn resolve_binary_path(binary: &str, config_path: &Path) -> Result<std::path::PathBuf, LoadError> {
+    // Interpolate environment variables in the binary path
+    let interpolated = env::interpolate_env(binary).map_err(LoadError::Validation)?;
+
+    let binary_path = std::path::Path::new(&interpolated);
+
+    // If already absolute, just canonicalize
+    if binary_path.is_absolute() {
+        return binary_path
+            .canonicalize()
+            .map_err(|e| LoadError::Validation(format!("binary '{}': {}", binary, e)));
+    }
+
+    // Resolve relative to config file's parent directory
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let resolved = config_dir.join(binary_path);
+
+    resolved
+        .canonicalize()
+        .map_err(|e| LoadError::Validation(format!("binary '{}': {}", binary, e)))
 }
 
 /// Validate a test spec for semantic correctness.
@@ -90,7 +124,13 @@ pub fn load_suite_config(dir: &Path) -> Result<Option<SuiteConfig>, LoadError> {
     }
 
     let contents = std::fs::read_to_string(&config_path).map_err(LoadError::Io)?;
-    let config: SuiteConfig = serde_yaml::from_str(&contents).map_err(LoadError::Yaml)?;
+    let mut config: SuiteConfig = serde_yaml::from_str(&contents).map_err(LoadError::Yaml)?;
+
+    // Resolve binary path relative to config file location
+    if let Some(binary) = &config.binary {
+        config.resolved_binary = Some(resolve_binary_path(binary, &config_path)?);
+    }
+
     Ok(Some(config))
 }
 
@@ -313,5 +353,41 @@ sandbox_dir: /tmp/custom-dir
             config.sandbox_dir,
             Some(SandboxDir::Path(p)) if p == PathBuf::from("/tmp/custom-dir")
         ));
+    }
+}
+
+#[cfg(test)]
+mod binary_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_binary_field_resolved() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.yaml");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"
+version: 1
+binary: /bin/echo
+tests:
+  - name: test1
+    run:
+      cmd: "${{BINARY}}"
+    expect:
+      exit: 0
+"#
+        )
+        .unwrap();
+
+        let spec = load_spec(&path).unwrap();
+        assert_eq!(spec.binary, Some("/bin/echo".to_string()));
+        assert!(
+            spec.resolved_binary.is_some(),
+            "resolved_binary should be set"
+        );
+        println!("resolved_binary: {:?}", spec.resolved_binary);
     }
 }

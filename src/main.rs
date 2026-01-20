@@ -27,17 +27,20 @@ enum OutputFormat {
 #[command(about = "A declarative integration test runner for executables")]
 #[command(version)]
 #[command(after_help = "\
-ENVIRONMENT VARIABLES:
-  Command paths in test specs support ${VAR} syntax for environment variable
-  expansion. This allows portable test specs without hardcoded binary paths:
+BINARY UNDER TEST:
+  Specify the binary under test with the 'binary' field in your spec:
+
+    version: 1
+    binary: ../target/release/myapp  # relative to this file
 
     tests:
       - name: my_test
         run:
-          cmd: \"${BINARY}\"   # Expands at runtime
+          cmd: \"${BINARY}\"   # automatically set from binary field
           args: [\"--help\"]
 
-  Run with: BINARY=./target/release/myapp bintest run tests/
+  The binary path is resolved relative to the spec file and validated at load time.
+  File-level 'binary' overrides suite-level 'binary' from bintest.yaml.
 ")]
 struct Cli {
     #[command(subcommand)]
@@ -420,6 +423,9 @@ fn main() {
         Command::Init { path } => {
             let template = r#"version: 1
 
+# The binary under test (path relative to this file)
+# binary: ../target/release/myapp
+
 sandbox:
   workdir: temp
   env:
@@ -456,8 +462,7 @@ tests:
       stdout:
         contains: "hello"
 
-  # Binary test example (use environment variable for portable paths):
-  # Run with: BINARY=./target/release/myapp bintest run tests/
+  # Binary test example (uses the 'binary' field above):
   # - name: binary_test
   #   run:
   #     cmd: "${BINARY}"

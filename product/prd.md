@@ -225,20 +225,39 @@ teardown:
 ```
 
 ### Binary Resolution
-- Binaries are resolved via PATH or absolute path
-- No implicit resolution from sandbox
-- Command paths support `${VAR}` environment variable expansion
-- Use environment variables to configure the binary under test:
+
+The binary under test is specified via the `binary` field at suite or file level:
 
 ```yaml
+version: 1
+binary: ../target/release/myapp  # relative to this file
+
 tests:
   - name: help_works
     run:
-      cmd: "${BINARY}"  # Set via: BINARY=./target/release/myapp bintest run
+      cmd: "${BINARY}"  # automatically set from binary field
       args: ["--help"]
     expect:
       exit: 0
 ```
+
+**Resolution rules:**
+- Paths are resolved relative to the file containing the `binary` field
+- File-level `binary` overrides suite-level `binary`
+- The resolved absolute path is available as `${BINARY}` in all commands
+- Supports `${VAR}` syntax for environment variable interpolation in paths
+
+**Hierarchy:**
+- Suite-level (`bintest.yaml`): Default binary for all spec files
+- File-level (spec file): Overrides suite-level for that file
+
+**Path validation:**
+- Binary path is resolved and validated at load time
+- Missing or inaccessible binaries produce clear error messages
+
+**Additional resolution:**
+- Commands can still use PATH lookup or absolute paths directly
+- Command paths support `${VAR}` environment variable expansion
 
 ### Setup / Teardown
 - Explicit setup steps

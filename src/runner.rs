@@ -264,6 +264,8 @@ pub struct EffectiveConfig {
     pub sandbox_dir: Option<SandboxDir>,
     /// Suite-level database configurations.
     pub databases: HashMap<String, DatabaseConfig>,
+    /// Resolved binary path from suite config (file-level can override).
+    pub resolved_binary: Option<PathBuf>,
 }
 
 impl EffectiveConfig {
@@ -277,6 +279,7 @@ impl EffectiveConfig {
                 capture_fs_diff: cfg.capture_fs_diff,
                 sandbox_dir: cfg.sandbox_dir.clone(),
                 databases: cfg.databases.clone(),
+                resolved_binary: cfg.resolved_binary.clone(),
             },
             None => Self::default(),
         }
@@ -316,6 +319,17 @@ fn run_spec_with_config(
         if !merged_sandbox.inherit_env {
             merged_sandbox.inherit_env = inherit;
         }
+    }
+
+    // Inject BINARY env var from resolved binary path (file-level overrides suite-level)
+    let effective_binary = spec
+        .resolved_binary
+        .as_ref()
+        .or(effective.resolved_binary.as_ref());
+    if let Some(binary_path) = effective_binary {
+        merged_sandbox
+            .env
+            .insert("BINARY".to_string(), binary_path.display().to_string());
     }
 
     // Determine file-level default timeout
@@ -660,8 +674,14 @@ fn run_command(
     ctx: &ExecutionContext,
     timeout: Duration,
 ) -> Result<CommandOutput, String> {
-    // Interpolate environment variables in cmd
-    let cmd_path = env::interpolate_env(&run.cmd)?;
+    // Merge context env with run-level env for interpolation
+    let mut effective_env = ctx.env.clone();
+    for (k, v) in &run.env {
+        effective_env.insert(k.clone(), v.clone());
+    }
+
+    // Interpolate environment variables in cmd using effective env
+    let cmd_path = env::interpolate_env_with(&run.cmd, &effective_env)?;
 
     let mut cmd = if run.shell {
         let mut c = Command::new("sh");
@@ -1618,6 +1638,8 @@ mod tests {
     fn make_spec(test: Test) -> TestSpec {
         TestSpec {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2381,6 +2403,8 @@ mod tests {
         let test2 = make_test("test_two", "echo", vec!["two"]);
         let spec = TestSpec {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2410,6 +2434,8 @@ mod tests {
         test2.serial = true;
         let spec = TestSpec {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2480,6 +2506,8 @@ mod tests {
         // Suite config sets 1 second timeout, test should timeout
         let suite_config = SuiteConfig {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             timeout: Some(1),
             env: HashMap::new(),
             inherit_env: None,
@@ -2507,6 +2535,8 @@ mod tests {
 
         let suite_config = SuiteConfig {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             timeout: None,
             env: suite_env,
             inherit_env: None,
@@ -2538,6 +2568,8 @@ mod tests {
 
         let suite_config = SuiteConfig {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             timeout: None,
             env: suite_env,
             inherit_env: None,
@@ -2569,6 +2601,8 @@ mod tests {
         // File-level timeout should override suite-level timeout
         let suite_config = SuiteConfig {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             timeout: Some(10), // Suite says 10 seconds
             env: HashMap::new(),
             inherit_env: None,
@@ -2614,6 +2648,8 @@ mod tests {
 
         let spec = TestSpec {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2649,6 +2685,8 @@ mod tests {
 
         let spec = TestSpec {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2694,6 +2732,8 @@ mod tests {
 
         let spec = TestSpec {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2729,6 +2769,8 @@ mod tests {
 
         let spec = TestSpec {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2760,6 +2802,8 @@ mod tests {
 
         let spec = TestSpec {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -3039,6 +3083,8 @@ mod tests {
         // Create a suite config with sandbox_dir: local
         let suite_config = SuiteConfig {
             version: 1,
+            binary: None,
+            resolved_binary: None,
             timeout: None,
             env: HashMap::new(),
             inherit_env: None,
@@ -3084,5 +3130,26 @@ mod tests {
 
         // Restore original directory
         std::env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    fn test_binary_env_injection() {
+        // Test that resolved_binary is injected as BINARY env var
+        let mut test = make_test("test_binary", "sh", vec!["-c", "echo $BINARY"]);
+        test.expect_mut().stdout = Some(OutputMatch::Structured(OutputMatchStructured {
+            equals: None,
+            contains: Some("/bin/echo".to_string()),
+            regex: None,
+        }));
+
+        let mut spec = make_spec(test);
+        spec.resolved_binary = Some(PathBuf::from("/bin/echo"));
+
+        let result = run_spec_standalone(&spec);
+        assert!(
+            result.tests[0].passed,
+            "Test should pass with BINARY env var: {:?}",
+            result.tests[0].failures
+        );
     }
 }

@@ -1,20 +1,21 @@
 # Binary Path Configuration Example
 #
-# This example demonstrates how to use environment variables for portable
-# binary paths. This allows test specs to work across different machines
-# and CI systems without hardcoding absolute paths.
+# This example demonstrates how to specify the binary under test using the
+# `binary` field. The path is resolved relative to this file at load time.
 #
-# Run with: BINARY=/bin/echo bintest run examples/binary-path.yaml
-# Or:       BINARY=./target/release/myapp bintest run examples/binary-path.yaml
+# Run with: bintest run examples/binary-path.yaml
 
 version: 1
+
+# The binary under test - resolved relative to this file
+binary: /bin/echo
 
 sandbox:
   workdir: temp
 
 tests:
-  # Basic binary path from environment variable
-  - name: binary_from_env
+  # Basic usage with ${BINARY}
+  - name: binary_from_config
     run:
       cmd: "${BINARY}"
       args: ["hello from binary"]
@@ -23,16 +24,18 @@ tests:
       stdout:
         contains: "hello from binary"
 
-  # Multiple environment variables in different commands
-  - name: different_binaries
+  # Multiple steps using the same binary
+  - name: multi_step_workflow
     steps:
-      - name: first_binary
+      - name: first_step
         run:
           cmd: "${BINARY}"
           args: ["step 1"]
         expect:
           exit: 0
-      - name: second_binary
+          stdout:
+            contains: "step 1"
+      - name: second_step
         run:
           cmd: "${BINARY}"
           args: ["step 2"]

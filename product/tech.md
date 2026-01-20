@@ -99,26 +99,47 @@ Three levels, each with optional setup/teardown:
 ## Execution Model
 
 - Commands are executed via `std::process::Command`
-- Binary resolution: PATH lookup or absolute path
+- Binary resolution: `binary` field, PATH lookup, or absolute path
 - Command paths support `${VAR}` environment variable expansion
 - No shell by default (shell optional, explicit)
 - Signals captured
+
+### Binary Under Test
+
+The `binary` field specifies the executable being tested:
+
+```yaml
+version: 1
+binary: ../target/release/myapp  # relative to this file
+
+tests:
+  - name: test_my_binary
+    run:
+      cmd: "${BINARY}"  # automatically populated from binary field
+      args: ["--version"]
+```
+
+**Resolution:**
+1. Path is resolved relative to the config file containing the `binary` field
+2. Path is canonicalized to an absolute path at load time
+3. The resolved path is injected as `BINARY` environment variable
+4. File-level `binary` overrides suite-level `binary`
+
+**Validation:**
+- Binary path must exist and be accessible at load time
+- Missing binaries produce clear error messages before tests run
 
 ### Command Path Interpolation
 
 The `cmd` field supports `${VAR}` syntax for environment variable expansion:
 
 ```yaml
-tests:
-  - name: test_my_binary
-    run:
-      cmd: "${BINARY}"  # Resolved at runtime
-      args: ["--version"]
+run:
+  cmd: "${BINARY}"     # from binary field
+  args: ["--version"]
 ```
 
-Run with: `BINARY=./target/release/myapp bintest run tests/`
-
-This allows test specs to be portable across machines and CI systems without hardcoding paths.
+The `${BINARY}` variable is automatically set when a `binary` field is defined.
 
 ### Timeouts
 
