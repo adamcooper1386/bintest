@@ -1,4 +1,5 @@
 mod database;
+mod env;
 mod loader;
 mod runner;
 mod schema;
@@ -25,6 +26,19 @@ enum OutputFormat {
 #[command(name = "bintest")]
 #[command(about = "A declarative integration test runner for executables")]
 #[command(version)]
+#[command(after_help = "\
+ENVIRONMENT VARIABLES:
+  Command paths in test specs support ${VAR} syntax for environment variable
+  expansion. This allows portable test specs without hardcoded binary paths:
+
+    tests:
+      - name: my_test
+        run:
+          cmd: \"${BINARY}\"   # Expands at runtime
+          args: [\"--help\"]
+
+  Run with: BINARY=./target/release/myapp bintest run tests/
+")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -441,6 +455,15 @@ tests:
       exit: 0
       stdout:
         contains: "hello"
+
+  # Binary test example (use environment variable for portable paths):
+  # Run with: BINARY=./target/release/myapp bintest run tests/
+  # - name: binary_test
+  #   run:
+  #     cmd: "${BINARY}"
+  #     args: ["--version"]
+  #   expect:
+  #     exit: 0
 
   # Database test example:
   # - name: database_test

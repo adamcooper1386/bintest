@@ -6,6 +6,7 @@
 // Allow dead code for now - these will be used when SQL assertions are implemented.
 #![allow(dead_code)]
 
+use crate::env;
 use crate::schema::{DatabaseConfig, DbDriver, DbIsolation};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -215,39 +216,13 @@ pub fn mask_password(url: &str) -> String {
 /// Interpolate environment variables in a string.
 ///
 /// Supports `${VAR}` syntax. Returns an error if a referenced variable is not set.
+/// This is a wrapper around `crate::env::interpolate_env` that returns a `DbError`.
 pub fn interpolate_env(s: &str) -> Result<String, DbError> {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '$' && chars.peek() == Some(&'{') {
-            chars.next(); // consume '{'
-            let mut var_name = String::new();
-            loop {
-                match chars.next() {
-                    Some('}') => break,
-                    Some(c) => var_name.push(c),
-                    None => {
-                        return Err(DbError {
-                            message: format!("Unclosed variable reference: ${{{var_name}"),
-                            database: None,
-                            masked_url: None,
-                        });
-                    }
-                }
-            }
-            let value = std::env::var(&var_name).map_err(|_| DbError {
-                message: format!("Environment variable '{var_name}' is not set"),
-                database: None,
-                masked_url: None,
-            })?;
-            result.push_str(&value);
-        } else {
-            result.push(c);
-        }
-    }
-
-    Ok(result)
+    env::interpolate_env(s).map_err(|msg| DbError {
+        message: msg,
+        database: None,
+        masked_url: None,
+    })
 }
 
 /// Connect to a database using the provided configuration.

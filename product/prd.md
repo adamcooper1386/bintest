@@ -227,6 +227,18 @@ teardown:
 ### Binary Resolution
 - Binaries are resolved via PATH or absolute path
 - No implicit resolution from sandbox
+- Command paths support `${VAR}` environment variable expansion
+- Use environment variables to configure the binary under test:
+
+```yaml
+tests:
+  - name: help_works
+    run:
+      cmd: "${BINARY}"  # Set via: BINARY=./target/release/myapp bintest run
+      args: ["--help"]
+    expect:
+      exit: 0
+```
 
 ### Setup / Teardown
 - Explicit setup steps

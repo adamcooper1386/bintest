@@ -100,8 +100,25 @@ Three levels, each with optional setup/teardown:
 
 - Commands are executed via `std::process::Command`
 - Binary resolution: PATH lookup or absolute path
+- Command paths support `${VAR}` environment variable expansion
 - No shell by default (shell optional, explicit)
 - Signals captured
+
+### Command Path Interpolation
+
+The `cmd` field supports `${VAR}` syntax for environment variable expansion:
+
+```yaml
+tests:
+  - name: test_my_binary
+    run:
+      cmd: "${BINARY}"  # Resolved at runtime
+      args: ["--version"]
+```
+
+Run with: `BINARY=./target/release/myapp bintest run tests/`
+
+This allows test specs to be portable across machines and CI systems without hardcoding paths.
 
 ### Timeouts
 
@@ -156,7 +173,7 @@ sqlite::memory:
 
 ### Environment Variable Interpolation
 
-Connection URLs support `${VAR}` syntax:
+Both command paths (`run.cmd`) and database connection URLs support `${VAR}` syntax:
 
 ```yaml
 databases:
@@ -168,7 +185,7 @@ databases:
     url: "postgres://${ROOT_USER}:${ROOT_PASSWORD}@${DB_HOST}:5432/postgres"
 ```
 
-Interpolation happens at spec load time. Missing variables cause validation errors.
+Interpolation happens at runtime. Missing variables cause execution errors with clear messages.
 
 ### Connection Lifecycle
 

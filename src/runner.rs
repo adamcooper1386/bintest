@@ -3,6 +3,7 @@
 //! Runs test specs in isolated sandboxes and captures results.
 
 use crate::database::ConnectionManager;
+use crate::env;
 use crate::schema::{
     Condition, DatabaseConfig, DbDriver, Expect, FileExpect, OutputMatch, OutputMatchStructured,
     RowCountExpect, Run, RunStep, Sandbox, SandboxDir, SetupStep, SqlExpect, SqlOnError,
@@ -106,7 +107,13 @@ fn check_condition(condition: &Condition) -> bool {
             return false;
         }
 
-        let result = Command::new(parts[0])
+        // Interpolate environment variables in command path
+        let cmd_path = match env::interpolate_env(parts[0]) {
+            Ok(path) => path,
+            Err(_) => return false, // Treat interpolation failure as condition not met
+        };
+
+        let result = Command::new(&cmd_path)
             .args(&parts[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -653,13 +660,16 @@ fn run_command(
     ctx: &ExecutionContext,
     timeout: Duration,
 ) -> Result<CommandOutput, String> {
+    // Interpolate environment variables in cmd
+    let cmd_path = env::interpolate_env(&run.cmd)?;
+
     let mut cmd = if run.shell {
         let mut c = Command::new("sh");
         c.arg("-c");
-        c.arg(format!("{} {}", run.cmd, run.args.join(" ")));
+        c.arg(format!("{} {}", cmd_path, run.args.join(" ")));
         c
     } else {
-        let mut c = Command::new(&run.cmd);
+        let mut c = Command::new(&cmd_path);
         c.args(&run.args);
         c
     };
@@ -1568,7 +1578,10 @@ fn run_teardown_step(
 }
 
 fn run_simple_command(run: &RunStep, ctx: &ExecutionContext) -> Result<(), String> {
-    let mut cmd = Command::new(&run.cmd);
+    // Interpolate environment variables in cmd
+    let cmd_path = env::interpolate_env(&run.cmd)?;
+
+    let mut cmd = Command::new(&cmd_path);
     cmd.args(&run.args);
     cmd.current_dir(&ctx.sandbox_dir);
 
@@ -1581,13 +1594,13 @@ fn run_simple_command(run: &RunStep, ctx: &ExecutionContext) -> Result<(), Strin
 
     let output = cmd
         .output()
-        .map_err(|e| format!("Failed to run {}: {e}", run.cmd))?;
+        .map_err(|e| format!("Failed to run {}: {e}", cmd_path))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "Command {} failed with exit code {:?}: {}",
-            run.cmd,
+            cmd_path,
             output.status.code(),
             stderr.trim()
         ));

@@ -1,0 +1,42 @@
+# Binary Path Configuration Example
+#
+# This example demonstrates how to use environment variables for portable
+# binary paths. This allows test specs to work across different machines
+# and CI systems without hardcoding absolute paths.
+#
+# Run with: BINARY=/bin/echo bintest run examples/binary-path.yaml
+# Or:       BINARY=./target/release/myapp bintest run examples/binary-path.yaml
+
+version: 1
+
+sandbox:
+  workdir: temp
+
+tests:
+  # Basic binary path from environment variable
+  - name: binary_from_env
+    run:
+      cmd: "${BINARY}"
+      args: ["hello from binary"]
+    expect:
+      exit: 0
+      stdout:
+        contains: "hello from binary"
+
+  # Multiple environment variables in different commands
+  - name: different_binaries
+    steps:
+      - name: first_binary
+        run:
+          cmd: "${BINARY}"
+          args: ["step 1"]
+        expect:
+          exit: 0
+      - name: second_binary
+        run:
+          cmd: "${BINARY}"
+          args: ["step 2"]
+        expect:
+          exit: 0
+          stdout:
+            contains: "step 2"
