@@ -120,6 +120,11 @@ pub struct TestSpec {
     #[serde(skip)]
     pub resolved_binary: Option<PathBuf>,
 
+    /// Environment variables for all tests in this file.
+    /// Merges with suite-level env (file-level overrides suite-level).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+
     /// Sandbox configuration for this spec file.
     #[serde(default)]
     pub sandbox: Sandbox,
@@ -427,6 +432,8 @@ enum TestFormat {
         #[serde(default)]
         description: Option<String>,
         #[serde(default)]
+        env: HashMap<String, String>,
+        #[serde(default)]
         skip_if: Vec<Condition>,
         #[serde(default)]
         require: Vec<Condition>,
@@ -447,6 +454,8 @@ enum TestFormat {
         name: String,
         #[serde(default)]
         description: Option<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
         #[serde(default)]
         skip_if: Vec<Condition>,
         #[serde(default)]
@@ -482,6 +491,11 @@ pub struct Test {
     /// Optional description.
     #[serde(default)]
     pub description: Option<String>,
+
+    /// Environment variables for this test.
+    /// Merges with file-level env (test-level overrides file-level).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 
     /// Conditions that cause the test to be skipped if ANY are true.
     /// Use for skipping tests in certain environments (e.g., skip_if env: CI).
@@ -527,6 +541,7 @@ impl<'de> Deserialize<'de> for Test {
             TestFormat::MultiStep {
                 name,
                 description,
+                env,
                 skip_if,
                 require,
                 setup,
@@ -538,6 +553,7 @@ impl<'de> Deserialize<'de> for Test {
             } => Test {
                 name,
                 description,
+                env,
                 skip_if,
                 require,
                 setup,
@@ -550,6 +566,7 @@ impl<'de> Deserialize<'de> for Test {
             TestFormat::SingleStep {
                 name,
                 description,
+                env,
                 skip_if,
                 require,
                 setup,
@@ -564,6 +581,7 @@ impl<'de> Deserialize<'de> for Test {
                 Test {
                     name,
                     description,
+                    env,
                     skip_if,
                     require,
                     setup,

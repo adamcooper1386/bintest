@@ -308,17 +308,16 @@ fn run_spec_with_config(
     effective: &EffectiveConfig,
     filter: Option<&str>,
 ) -> SpecResult {
-    // Merge suite env with sandbox env (sandbox takes precedence)
-    let mut merged_sandbox = spec.sandbox.clone();
-    for (k, v) in &effective.suite_env {
-        merged_sandbox.env.entry(k.clone()).or_insert(v.clone());
+    // Build merged environment: suite < file < sandbox
+    // Start with suite env
+    let mut file_env = effective.suite_env.clone();
+    // Merge file-level env (overrides suite)
+    for (k, v) in &spec.env {
+        file_env.insert(k.clone(), v.clone());
     }
-    // Apply suite-level inherit_env if file doesn't specify differently
-    if let Some(inherit) = effective.inherit_env {
-        // Only override if sandbox has default (false)
-        if !merged_sandbox.inherit_env {
-            merged_sandbox.inherit_env = inherit;
-        }
+    // Merge sandbox env (overrides file)
+    for (k, v) in &spec.sandbox.env {
+        file_env.insert(k.clone(), v.clone());
     }
 
     // Inject BINARY env var from resolved binary path (file-level overrides suite-level)
@@ -327,9 +326,19 @@ fn run_spec_with_config(
         .as_ref()
         .or(effective.resolved_binary.as_ref());
     if let Some(binary_path) = effective_binary {
-        merged_sandbox
-            .env
-            .insert("BINARY".to_string(), binary_path.display().to_string());
+        file_env.insert("BINARY".to_string(), binary_path.display().to_string());
+    }
+
+    // Create merged sandbox with combined env
+    let mut merged_sandbox = spec.sandbox.clone();
+    merged_sandbox.env = file_env;
+
+    // Apply suite-level inherit_env if file doesn't specify differently
+    if let Some(inherit) = effective.inherit_env {
+        // Only override if sandbox has default (false)
+        if !merged_sandbox.inherit_env {
+            merged_sandbox.inherit_env = inherit;
+        }
     }
 
     // Determine file-level default timeout
@@ -579,7 +588,7 @@ fn run_test(
         }
 
         // Run the step command
-        let step_failed = match run_command(&step.run, ctx, timeout) {
+        let step_failed = match run_command(&step.run, ctx, &test.env, timeout) {
             Ok(output) => {
                 // Check step assertions
                 let mut step_failures = Vec::new();
@@ -672,10 +681,14 @@ struct CommandOutput {
 fn run_command(
     run: &Run,
     ctx: &ExecutionContext,
+    test_env: &HashMap<String, String>,
     timeout: Duration,
 ) -> Result<CommandOutput, String> {
-    // Merge context env with run-level env for interpolation
+    // Merge environment: ctx.env < test_env < run.env
     let mut effective_env = ctx.env.clone();
+    for (k, v) in test_env {
+        effective_env.insert(k.clone(), v.clone());
+    }
     for (k, v) in &run.env {
         effective_env.insert(k.clone(), v.clone());
     }
@@ -702,14 +715,11 @@ fn run_command(
         .unwrap_or_else(|| ctx.sandbox_dir.clone());
     cmd.current_dir(&cwd);
 
-    // Set environment
+    // Set environment (using already-merged effective_env)
     if !ctx.inherit_env {
         cmd.env_clear();
     }
-    for (k, v) in &ctx.env {
-        cmd.env(k, v);
-    }
-    for (k, v) in &run.env {
+    for (k, v) in &effective_env {
         cmd.env(k, v);
     }
 
@@ -1640,6 +1650,7 @@ mod tests {
             version: 1,
             binary: None,
             resolved_binary: None,
+            env: HashMap::new(),
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -1660,6 +1671,7 @@ mod tests {
         Test {
             name: name.to_string(),
             description: None,
+            env: HashMap::new(),
             skip_if: vec![],
             require: vec![],
             setup: vec![],
@@ -2405,6 +2417,7 @@ mod tests {
             version: 1,
             binary: None,
             resolved_binary: None,
+            env: HashMap::new(),
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2436,6 +2449,7 @@ mod tests {
             version: 1,
             binary: None,
             resolved_binary: None,
+            env: HashMap::new(),
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2650,6 +2664,7 @@ mod tests {
             version: 1,
             binary: None,
             resolved_binary: None,
+            env: HashMap::new(),
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2687,6 +2702,7 @@ mod tests {
             version: 1,
             binary: None,
             resolved_binary: None,
+            env: HashMap::new(),
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2734,6 +2750,7 @@ mod tests {
             version: 1,
             binary: None,
             resolved_binary: None,
+            env: HashMap::new(),
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2771,6 +2788,7 @@ mod tests {
             version: 1,
             binary: None,
             resolved_binary: None,
+            env: HashMap::new(),
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,
@@ -2804,6 +2822,7 @@ mod tests {
             version: 1,
             binary: None,
             resolved_binary: None,
+            env: HashMap::new(),
             sandbox: Sandbox::default(),
             timeout: None,
             capture_fs_diff: None,

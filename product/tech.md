@@ -141,6 +141,35 @@ run:
 
 The `${BINARY}` variable is automatically set when a `binary` field is defined.
 
+### Environment Variables
+
+Environment variables are merged from multiple levels:
+
+```yaml
+version: 1
+env:                    # file-level
+  APP_ENV: test
+
+tests:
+  - name: my_test
+    env:                # test-level (overrides file)
+      DEBUG: "true"
+    run:
+      cmd: my_app
+      env:              # command-level (overrides test)
+        VERBOSE: "1"
+```
+
+**Merge order (lowest to highest priority):**
+1. Suite-level (`bintest.yaml` env)
+2. File-level (spec file top-level env)
+3. Sandbox-level (sandbox.env)
+4. Test-level (test.env)
+5. Command-level (run.env)
+
+Variables from higher priority levels override those from lower levels.
+The merged environment is used for both `${VAR}` interpolation and command execution.
+
 ### Timeouts
 
 - Default: 3 seconds per test

@@ -259,6 +259,39 @@ tests:
 - Commands can still use PATH lookup or absolute paths directly
 - Command paths support `${VAR}` environment variable expansion
 
+### Environment Variables
+
+Environment variables can be set at multiple levels, with more specific levels overriding less specific:
+
+```yaml
+# Suite level (bintest.yaml)
+version: 1
+env:
+  LOG_LEVEL: info
+  APP_ENV: test
+
+# File level (spec file)
+version: 1
+env:
+  LOG_LEVEL: debug  # overrides suite
+
+tests:
+  - name: my_test
+    env:
+      LOG_LEVEL: trace  # overrides file
+    run:
+      cmd: my_app
+      env:
+        LOG_LEVEL: error  # overrides test (command-level)
+```
+
+**Hierarchy (lowest to highest priority):**
+1. Suite-level `env` (bintest.yaml)
+2. File-level `env` (spec file top-level)
+3. Sandbox `env` (spec file sandbox.env)
+4. Test-level `env` (per-test)
+5. Command-level `env` (per-run)
+
 ### Setup / Teardown
 - Explicit setup steps
 - Explicit teardown steps
